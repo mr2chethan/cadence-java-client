@@ -409,4 +409,77 @@ public class JacksonDataConverterTest {
     byte[] invalid = "not valid json{{{".getBytes(StandardCharsets.UTF_8);
     converter.fromDataArray(invalid, String.class, Integer.class);
   }
+
+  // -------- Exception subclass with extra fields (Gitar Bug 1) --------
+
+  /** Exception subclass with extra fields that must survive round-trip. */
+  public static class DetailedException extends RuntimeException {
+    private final int errorCode;
+    private final String errorDetail;
+
+    public DetailedException(String message, int errorCode, String errorDetail) {
+      super(message);
+      this.errorCode = errorCode;
+      this.errorDetail = errorDetail;
+    }
+
+    // For deserialization fallback
+    public DetailedException(String message) {
+      super(message);
+      this.errorCode = 0;
+      this.errorDetail = null;
+    }
+
+    public int getErrorCode() {
+      return errorCode;
+    }
+
+    public String getErrorDetail() {
+      return errorDetail;
+    }
+  }
+
+  @Test
+  public void testExceptionSubclassWithExtraFields() {
+    DetailedException e = new DetailedException("failed", 42, "extra detail");
+    byte[] converted = converter.toData(e);
+    // Verify the JSON contains the class field and the extra fields
+    String json = new String(converted, StandardCharsets.UTF_8);
+    assertTrue("Should contain class field", json.contains("\"class\""));
+    assertTrue(
+        "Should contain exception class name",
+        json.contains("com.uber.cadence.converter.JacksonDataConverterTest$DetailedException"));
+    assertTrue("Should contain errorCode", json.contains("\"errorCode\""));
+    assertTrue("Should contain errorDetail", json.contains("\"errorDetail\""));
+
+    // Round-trip deserialization should preserve the type
+    DetailedException fromConverted =
+        converter.fromData(converted, DetailedException.class, DetailedException.class);
+    assertEquals(DetailedException.class, fromConverted.getClass());
+    assertEquals("failed", fromConverted.getMessage());
+    assertNotNull(fromConverted.getStackTrace());
+    assertTrue(fromConverted.getStackTrace().length > 0);
+  }
+
+  // -------- Nested/suppressed throwable wire format (Gitar Bug 2) --------
+
+  @Test
+  public void testNestedThrowableHasClassField() {
+    RuntimeException cause = new RuntimeException("inner cause");
+    RuntimeException outer = new RuntimeException("outer", cause);
+    byte[] converted = converter.toData(outer);
+    String json = new String(converted, StandardCharsets.UTF_8);
+
+    // Both the outer and inner throwable should have the "class" field
+    // This verifies that the ThrowableSerializer is used at all nesting levels
+    assertTrue("Outer should have class field", json.contains("\"class\":\"java.lang.RuntimeException\""));
+    assertTrue("Should have cause with class field", json.contains("\"cause\""));
+
+    // Verify round-trip
+    RuntimeException fromConverted =
+        converter.fromData(converted, RuntimeException.class, RuntimeException.class);
+    assertEquals("outer", fromConverted.getMessage());
+    assertNotNull(fromConverted.getCause());
+    assertEquals("inner cause", fromConverted.getCause().getMessage());
+  }
 }

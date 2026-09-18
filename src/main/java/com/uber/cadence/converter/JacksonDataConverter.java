@@ -22,7 +22,6 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.BeanDescription;
 import com.fasterxml.jackson.databind.DeserializationConfig;
 import com.fasterxml.jackson.databind.DeserializationContext;
@@ -156,6 +155,9 @@ public final class JacksonDataConverter implements DataConverter {
     cadenceModule.addDeserializer(DataConverter.class, new DataConverterDeserializer());
     cadenceModule.addSerializer(Class.class, new ClassSerializer());
     cadenceModule.addDeserializer(Class.class, new ClassDeserializer());
+    // Serialize every Throwable (top-level, nested, suppressed) with the compact
+    // {"class":..,"stackTrace":"..","cause":{..}} format, matching Gson's behavior.
+    cadenceModule.addSerializer(Throwable.class, new ThrowableSerializer(mapper));
     cadenceModule.setDeserializerModifier(new ThrowableDeserializerModifier());
     mapper.registerModule(cadenceModule);
 
@@ -174,25 +176,12 @@ public final class JacksonDataConverter implements DataConverter {
     }
     try {
       if (values.length == 1) {
-        Object value = values[0];
-        if (value instanceof Throwable) {
-          return serializeThrowable((Throwable) value);
-        }
-        String json = objectMapper.writeValueAsString(value);
+        // The registered ThrowableSerializer handles Throwables automatically,
+        // so no special-casing needed here.
+        String json = objectMapper.writeValueAsString(values[0]);
         return json.getBytes(StandardCharsets.UTF_8);
       }
-
-      // For multiple values, serialize each individually (handling Throwables specially)
-      ArrayNode arrayNode = objectMapper.createArrayNode();
-      for (Object value : values) {
-        if (value instanceof Throwable) {
-          JsonNode throwableNode = throwableToJsonNode((Throwable) value);
-          arrayNode.add(throwableNode);
-        } else {
-          arrayNode.add(objectMapper.valueToTree(value));
-        }
-      }
-      String json = objectMapper.writeValueAsString(arrayNode);
+      String json = objectMapper.writeValueAsString(values);
       return json.getBytes(StandardCharsets.UTF_8);
     } catch (DataConverterException e) {
       throw e;
@@ -284,12 +273,15 @@ public final class JacksonDataConverter implements DataConverter {
 
   // ---------- Throwable serialization (matches Gson CustomThrowableTypeAdapter behavior) ----------
 
-  private byte[] serializeThrowable(Throwable throwable) throws JsonProcessingException {
-    JsonNode node = throwableToJsonNode(throwable);
-    return objectMapper.writeValueAsString(node).getBytes(StandardCharsets.UTF_8);
-  }
-
-  private JsonNode throwableToJsonNode(Throwable throwable) {
+  /**
+   * Converts a Throwable to a compact JSON node with "class", "stackTrace" (as string), and
+   * "cause" fields. This is a static method so it can be used from both the instance methods and the
+   * registered ThrowableSerializer.
+   *
+   * @param throwable the throwable to serialize
+   * @param mapper the ObjectMapper to use for field serialization
+   */
+  static JsonNode throwableToJsonNode(Throwable throwable, ObjectMapper mapper) {
     StringWriter sw = new StringWriter();
     PrintWriter pw = new PrintWriter(sw);
     StackTraceElement[] trace = throwable.getStackTrace();
@@ -316,7 +308,9 @@ public final class JacksonDataConverter implements DataConverter {
 
     ObjectNode object;
     try {
-      object = objectMapper.valueToTree(throwable);
+      // Temporarily disable the Throwable serializer to get raw field output.
+      // We build the node manually so we need the plain bean fields.
+      object = buildThrowableFieldsNode(throwable, mapper);
       object.put("class", throwable.getClass().getName());
       object.put("stackTrace", sw.toString());
     } catch (Throwable e) {
@@ -326,8 +320,8 @@ public final class JacksonDataConverter implements DataConverter {
         ee.addSuppressed(cause);
         cause = null;
       }
-      object = objectMapper.createObjectNode();
-      JsonNode eeNode = throwableToJsonNode(ee);
+      object = mapper.createObjectNode();
+      JsonNode eeNode = throwableToJsonNode(ee, mapper);
       if (eeNode.isObject()) {
         object.setAll((ObjectNode) eeNode);
       }
@@ -335,16 +329,58 @@ public final class JacksonDataConverter implements DataConverter {
 
     if (cause != null) {
       try {
-        object.set("cause", throwableToJsonNode(cause));
+        object.set("cause", throwableToJsonNode(cause, mapper));
       } catch (Throwable e) {
         DataConverterException ee =
             new DataConverterException("Failure serializing exception: " + cause.toString(), e);
         ee.setStackTrace(cause.getStackTrace());
-        object.set("cause", throwableToJsonNode(ee));
+        object.set("cause", throwableToJsonNode(ee, mapper));
       }
     }
 
     return object;
+  }
+
+  /**
+   * Builds a JSON object containing the throwable's fields (detailMessage, suppressedExceptions,
+   * and any subclass-specific fields) without invoking the custom ThrowableSerializer.
+   */
+  private static ObjectNode buildThrowableFieldsNode(Throwable throwable, ObjectMapper mapper) {
+    ObjectNode node = mapper.createObjectNode();
+    // Always include the message
+    node.put("detailMessage", throwable.getMessage());
+
+    // Serialize subclass-specific fields via reflection
+    Class<?> clazz = throwable.getClass();
+    while (clazz != null && clazz != Throwable.class && clazz != Object.class) {
+      for (Field field : clazz.getDeclaredFields()) {
+        if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) {
+          continue;
+        }
+        try {
+          field.setAccessible(true);
+          Object value = field.get(throwable);
+          node.set(field.getName(), mapper.valueToTree(value));
+        } catch (Exception e) {
+          log.warn("Failed to serialize field: " + field.getName(), e);
+        }
+      }
+      clazz = clazz.getSuperclass();
+    }
+
+    // Suppressed exceptions
+    Throwable[] suppressed = throwable.getSuppressed();
+    if (suppressed != null && suppressed.length > 0) {
+      ArrayNode suppressedArray = mapper.createArrayNode();
+      for (Throwable s : suppressed) {
+        suppressedArray.add(throwableToJsonNode(s, mapper));
+      }
+      node.set("suppressedExceptions", suppressedArray);
+    } else {
+      node.set("suppressedExceptions", mapper.createArrayNode());
+    }
+
+    return node;
   }
 
   @SuppressWarnings("unchecked")
@@ -539,8 +575,29 @@ public final class JacksonDataConverter implements DataConverter {
   }
 
   /**
-   * Modifier that intercepts Throwable deserialization to avoid Jackson's default handling which
-   * doesn't work well with Throwable's constructor patterns.
+   * Serializes every Throwable (top-level, nested, or suppressed) through {@link
+   * #throwableToJsonNode} so the compact, class-tagged format is always used — matching the Gson
+   * CustomThrowableTypeAdapter behavior.
+   */
+  private static class ThrowableSerializer extends JsonSerializer<Throwable> {
+    private final ObjectMapper mapper;
+
+    ThrowableSerializer(ObjectMapper mapper) {
+      this.mapper = mapper;
+    }
+
+    @Override
+    public void serialize(Throwable value, JsonGenerator gen, SerializerProvider provider)
+        throws IOException {
+      JsonNode node = throwableToJsonNode(value, mapper);
+      gen.writeTree(node);
+    }
+  }
+
+  /**
+   * Modifier that intercepts Throwable deserialization. Keeps the default (bean) deserializer as a
+   * delegate so that subclass fields are preserved, falling back to constructor-based construction
+   * only when the delegate cannot handle the type.
    */
   private static class ThrowableDeserializerModifier extends BeanDeserializerModifier {
     @Override
@@ -549,21 +606,25 @@ public final class JacksonDataConverter implements DataConverter {
         BeanDescription beanDesc,
         JsonDeserializer<?> deserializer) {
       if (Throwable.class.isAssignableFrom(beanDesc.getBeanClass())) {
-        return new ThrowableDeserializer(beanDesc.getBeanClass());
+        return new ThrowableDeserializer(beanDesc.getBeanClass(), deserializer);
       }
       return deserializer;
     }
   }
 
   /**
-   * Custom deserializer for Throwable types that handles construction via reflection, since Jackson
-   * cannot normally construct Throwables from their JSON representation.
+   * Custom deserializer for Throwable types. Delegates to the default bean deserializer first so
+   * that the concrete type and all declared fields are restored — matching the Gson path which uses
+   * a reflective bean adapter. Falls back to constructor-based construction only when the delegate
+   * cannot handle the type (e.g. package-private constructors).
    */
   private static class ThrowableDeserializer extends JsonDeserializer<Throwable> {
     private final Class<?> targetClass;
+    private final JsonDeserializer<?> delegate;
 
-    ThrowableDeserializer(Class<?> targetClass) {
+    ThrowableDeserializer(Class<?> targetClass, JsonDeserializer<?> delegate) {
       this.targetClass = targetClass;
+      this.delegate = delegate;
     }
 
     @Override
@@ -574,16 +635,34 @@ public final class JacksonDataConverter implements DataConverter {
         message = node.get("detailMessage").asText();
       }
 
-      Throwable result;
-      try {
-        Constructor<?> constructor = targetClass.getConstructor(String.class);
-        result = (Throwable) constructor.newInstance(message);
-      } catch (Exception e1) {
+      Throwable result = null;
+
+      // Try delegate first to preserve subclass type and fields
+      if (delegate != null) {
         try {
-          Constructor<?> constructor = targetClass.getConstructor();
-          result = (Throwable) constructor.newInstance();
-        } catch (Exception e2) {
-          result = new RuntimeException(message);
+          JsonParser nodeParser = node.traverse(p.getCodec());
+          nodeParser.nextToken();
+          result = (Throwable) delegate.deserialize(nodeParser, ctxt);
+        } catch (Exception e) {
+          // Delegate failed — fall through to constructor-based construction
+          log.debug("Delegate deserialization failed for {}, falling back.", targetClass, e);
+        }
+      }
+
+      // Fall back to constructor-based construction
+      if (result == null) {
+        try {
+          Constructor<?> constructor = targetClass.getDeclaredConstructor(String.class);
+          constructor.setAccessible(true);
+          result = (Throwable) constructor.newInstance(message);
+        } catch (Exception e1) {
+          try {
+            Constructor<?> constructor = targetClass.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            result = (Throwable) constructor.newInstance();
+          } catch (Exception e2) {
+            result = new RuntimeException(message);
+          }
         }
       }
 
