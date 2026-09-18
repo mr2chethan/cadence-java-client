@@ -452,11 +452,13 @@ public class JacksonDataConverterTest {
     assertTrue("Should contain errorCode", json.contains("\"errorCode\""));
     assertTrue("Should contain errorDetail", json.contains("\"errorDetail\""));
 
-    // Round-trip deserialization should preserve the type
+    // Round-trip deserialization should preserve the type and fields
     DetailedException fromConverted =
         converter.fromData(converted, DetailedException.class, DetailedException.class);
     assertEquals(DetailedException.class, fromConverted.getClass());
     assertEquals("failed", fromConverted.getMessage());
+    assertEquals(42, fromConverted.getErrorCode());
+    assertEquals("extra detail", fromConverted.getErrorDetail());
     assertNotNull(fromConverted.getStackTrace());
     assertTrue(fromConverted.getStackTrace().length > 0);
   }
