@@ -97,8 +97,8 @@ public class JacksonDataConverterTest {
     byte[] data = converter.toData(map);
     @SuppressWarnings("unchecked")
     Map<String, Integer> result = converter.fromData(data, Map.class, Map.class);
-    assertEquals(1, result.get("one"));
-    assertEquals(2, result.get("two"));
+    assertEquals((Integer) 1, result.get("one"));
+    assertEquals((Integer) 2, result.get("two"));
   }
 
   public static void foo(List<UUID> arg) {}
@@ -277,11 +277,9 @@ public class JacksonDataConverterTest {
 
   @Test
   public void testOffsetDateTime() {
-    OffsetDateTime odt =
-        OffsetDateTime.of(2025, 4, 15, 10, 30, 0, 0, ZoneOffset.ofHours(5));
+    OffsetDateTime odt = OffsetDateTime.of(2025, 4, 15, 10, 30, 0, 0, ZoneOffset.ofHours(5));
     byte[] data = converter.toData(odt);
-    OffsetDateTime result =
-        converter.fromData(data, OffsetDateTime.class, OffsetDateTime.class);
+    OffsetDateTime result = converter.fromData(data, OffsetDateTime.class, OffsetDateTime.class);
     assertEquals(odt, result);
   }
 
@@ -474,7 +472,8 @@ public class JacksonDataConverterTest {
 
     // Both the outer and inner throwable should have the "class" field
     // This verifies that the ThrowableSerializer is used at all nesting levels
-    assertTrue("Outer should have class field", json.contains("\"class\":\"java.lang.RuntimeException\""));
+    assertTrue(
+        "Outer should have class field", json.contains("\"class\":\"java.lang.RuntimeException\""));
     assertTrue("Should have cause with class field", json.contains("\"cause\""));
 
     // Verify round-trip

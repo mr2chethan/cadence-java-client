@@ -230,8 +230,7 @@ public final class JacksonDataConverter implements DataConverter {
         return new Object[] {result};
       }
 
-      JsonNode rootNode =
-          objectMapper.readTree(new String(content, StandardCharsets.UTF_8));
+      JsonNode rootNode = objectMapper.readTree(new String(content, StandardCharsets.UTF_8));
       ArrayNode array;
       if (rootNode.isArray()) {
         array = (ArrayNode) rootNode;
@@ -253,13 +252,10 @@ public final class JacksonDataConverter implements DataConverter {
           JavaType javaType = objectMapper.getTypeFactory().constructType(valueTypes[i]);
           if (Throwable.class.isAssignableFrom(javaType.getRawClass())) {
             byte[] elementBytes =
-                objectMapper
-                    .writeValueAsString(array.get(i))
-                    .getBytes(StandardCharsets.UTF_8);
+                objectMapper.writeValueAsString(array.get(i)).getBytes(StandardCharsets.UTF_8);
             result[i] = deserializeThrowable(elementBytes, javaType);
           } else {
-            result[i] =
-                objectMapper.treeToValue(array.get(i), javaType);
+            result[i] = objectMapper.treeToValue(array.get(i), javaType);
           }
         }
       }
@@ -271,11 +267,12 @@ public final class JacksonDataConverter implements DataConverter {
     }
   }
 
-  // ---------- Throwable serialization (matches Gson CustomThrowableTypeAdapter behavior) ----------
+  // ---------- Throwable serialization (matches Gson CustomThrowableTypeAdapter behavior)
+  // ----------
 
   /**
-   * Converts a Throwable to a compact JSON node with "class", "stackTrace" (as string), and
-   * "cause" fields. This is a static method so it can be used from both the instance methods and the
+   * Converts a Throwable to a compact JSON node with "class", "stackTrace" (as string), and "cause"
+   * fields. This is a static method so it can be used from both the instance methods and the
    * registered ThrowableSerializer.
    *
    * @param throwable the throwable to serialize
@@ -387,8 +384,7 @@ public final class JacksonDataConverter implements DataConverter {
 
   @SuppressWarnings("unchecked")
   private <T> T deserializeThrowable(byte[] content, JavaType javaType) throws IOException {
-    JsonNode rootNode =
-        objectMapper.readTree(new String(content, StandardCharsets.UTF_8));
+    JsonNode rootNode = objectMapper.readTree(new String(content, StandardCharsets.UTF_8));
     if (!rootNode.isObject()) {
       throw new DataConverterException(
           content, new Type[] {javaType}, new IOException("Expected JSON object for Throwable"));
@@ -396,7 +392,8 @@ public final class JacksonDataConverter implements DataConverter {
     return (T) throwableFromJsonNode((ObjectNode) rootNode, objectMapper);
   }
 
-  static Throwable throwableFromJsonNode(ObjectNode object, ObjectMapper mapper) throws IOException {
+  static Throwable throwableFromJsonNode(ObjectNode object, ObjectMapper mapper)
+      throws IOException {
     JsonNode classElement = object.get("class");
     if (classElement == null) {
       throw new IOException("Missing 'class' field in Throwable JSON");
@@ -605,9 +602,7 @@ public final class JacksonDataConverter implements DataConverter {
   private static class ThrowableDeserializerModifier extends BeanDeserializerModifier {
     @Override
     public JsonDeserializer<?> modifyDeserializer(
-        DeserializationConfig config,
-        BeanDescription beanDesc,
-        JsonDeserializer<?> deserializer) {
+        DeserializationConfig config, BeanDescription beanDesc, JsonDeserializer<?> deserializer) {
       if (Throwable.class.isAssignableFrom(beanDesc.getBeanClass())) {
         return new ThrowableDeserializer(beanDesc.getBeanClass(), deserializer);
       }
@@ -690,8 +685,7 @@ public final class JacksonDataConverter implements DataConverter {
         for (JsonNode suppressed : node.get("suppressedExceptions")) {
           try {
             if (suppressed.has("detailMessage")) {
-              result.addSuppressed(
-                  new RuntimeException(suppressed.get("detailMessage").asText()));
+              result.addSuppressed(new RuntimeException(suppressed.get("detailMessage").asText()));
             }
           } catch (Exception e) {
             // ignore
