@@ -140,6 +140,9 @@ public final class JacksonDataConverter implements DataConverter {
     // Write dates as ISO strings, not timestamps
     mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
+    // Preserve original timezone offset (e.g. +05:00) instead of normalizing to UTC
+    mapper.disable(DeserializationFeature.ADJUST_DATES_TO_CONTEXT_TIME_ZONE);
+
     // Tolerate unknown properties during deserialization
     mapper.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
@@ -427,6 +430,11 @@ public final class JacksonDataConverter implements DataConverter {
       result = constructThrowable(classType, object);
     }
 
+    // Restore subclass-specific fields via reflection.
+    // Jackson's default deserialization may not populate final fields,
+    // so we do it manually from the JSON node.
+    restoreSubclassFields(result, object, mapper);
+
     result.setStackTrace(stackTrace);
 
     // Restore cause
@@ -461,6 +469,36 @@ public final class JacksonDataConverter implements DataConverter {
       } catch (Exception e2) {
         return new RuntimeException(message);
       }
+    }
+  }
+
+  /**
+   * Restores subclass-specific fields on a Throwable instance from the JSON object node. This
+   * handles cases where Jackson cannot populate final fields through normal deserialization.
+   */
+  private static void restoreSubclassFields(
+      Throwable result, ObjectNode object, ObjectMapper mapper) {
+    Class<?> clazz = result.getClass();
+    while (clazz != null && clazz != Throwable.class && clazz != Object.class) {
+      for (Field field : clazz.getDeclaredFields()) {
+        if (java.lang.reflect.Modifier.isStatic(field.getModifiers())
+            || java.lang.reflect.Modifier.isTransient(field.getModifiers())
+            || field.isSynthetic()) {
+          continue;
+        }
+        JsonNode valueNode = object.get(field.getName());
+        if (valueNode != null && !valueNode.isNull()) {
+          try {
+            field.setAccessible(true);
+            JavaType fieldType = mapper.getTypeFactory().constructType(field.getGenericType());
+            Object value = mapper.treeToValue(valueNode, fieldType);
+            field.set(result, value);
+          } catch (Exception e) {
+            log.debug("Failed to restore field: " + field.getName(), e);
+          }
+        }
+      }
+      clazz = clazz.getSuperclass();
     }
   }
 
