@@ -140,6 +140,9 @@ public final class JacksonDataConverter implements DataConverter {
     // Write dates as ISO strings, not timestamps
     mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
+    // Keep the region zone id (e.g. [America/New_York]) so ZonedDateTime round-trips exactly
+    mapper.enable(SerializationFeature.WRITE_DATES_WITH_ZONE_ID);
+
     // Preserve original timezone offset (e.g. +05:00) instead of normalizing to UTC
     mapper.disable(DeserializationFeature.ADJUST_DATES_TO_CONTEXT_TIME_ZONE);
 

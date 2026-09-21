@@ -29,6 +29,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -273,6 +274,14 @@ public class JacksonDataConverterTest {
     byte[] data = converter.toData(zdt);
     ZonedDateTime result = converter.fromData(data, ZonedDateTime.class, ZonedDateTime.class);
     assertEquals(zdt, result);
+
+    // Test with a region zone to ensure WRITE_DATES_WITH_ZONE_ID is working
+    ZonedDateTime zdtRegion =
+        ZonedDateTime.of(2025, 4, 15, 10, 30, 0, 0, ZoneId.of("America/New_York"));
+    byte[] dataRegion = converter.toData(zdtRegion);
+    ZonedDateTime resultRegion =
+        converter.fromData(dataRegion, ZonedDateTime.class, ZonedDateTime.class);
+    assertEquals(zdtRegion, resultRegion);
   }
 
   @Test
