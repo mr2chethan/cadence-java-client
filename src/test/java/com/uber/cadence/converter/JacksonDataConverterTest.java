@@ -423,6 +423,8 @@ public class JacksonDataConverterTest {
   public static class DetailedException extends RuntimeException {
     private final int errorCode;
     private final String errorDetail;
+    private transient String transientField = "transient";
+    private static String staticField = "static";
 
     public DetailedException(String message, int errorCode, String errorDetail) {
       super(message);
@@ -468,6 +470,25 @@ public class JacksonDataConverterTest {
     assertEquals("extra detail", fromConverted.getErrorDetail());
     assertNotNull(fromConverted.getStackTrace());
     assertTrue(fromConverted.getStackTrace().length > 0);
+  }
+
+  @Test
+  public void testExceptionSubclassWithInvalidField() {
+    DetailedException e = new DetailedException("failed", 42, "extra detail");
+    byte[] converted = converter.toData(e);
+    String json = new String(converted, StandardCharsets.UTF_8);
+    // Replace "errorCode":42 with "errorCode":["invalid"] to cause a deserialization exception
+    json = json.replace("\"errorCode\":42", "\"errorCode\":[\"invalid\"]");
+
+    // Deserialization should succeed for the exception, but log a warning and leave errorCode as 0
+    DetailedException fromConverted =
+        converter.fromData(
+            json.getBytes(StandardCharsets.UTF_8),
+            DetailedException.class,
+            DetailedException.class);
+    assertEquals("failed", fromConverted.getMessage());
+    assertEquals(0, fromConverted.getErrorCode()); // Default value since it failed to restore
+    assertEquals("extra detail", fromConverted.getErrorDetail());
   }
 
   // -------- Nested/suppressed throwable wire format (Gitar Bug 2) --------
