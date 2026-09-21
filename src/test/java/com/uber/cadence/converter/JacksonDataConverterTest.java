@@ -460,6 +460,10 @@ public class JacksonDataConverterTest {
         json.contains("com.uber.cadence.converter.JacksonDataConverterTest$DetailedException"));
     assertTrue("Should contain errorCode", json.contains("\"errorCode\""));
     assertTrue("Should contain errorDetail", json.contains("\"errorDetail\""));
+    assertFalse("transient field must be skipped", json.contains("transientField"));
+    assertFalse("static field must be skipped", json.contains("staticField"));
+    assertEquals("transient", e.transientField);
+    assertEquals("static", DetailedException.staticField);
 
     // Round-trip deserialization should preserve the type and fields
     DetailedException fromConverted =
