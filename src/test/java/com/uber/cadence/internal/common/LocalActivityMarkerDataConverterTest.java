@@ -17,6 +17,7 @@
 
 package com.uber.cadence.internal.common;
 
+import static com.uber.cadence.converter.JacksonDataConverterTest.newCustomizedConverter;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -71,6 +72,7 @@ public class LocalActivityMarkerDataConverterTest {
           break;
         case "jackson":
           result.add(new Object[] {name, JacksonDataConverter.getInstance()});
+          result.add(new Object[] {"jackson-customized", newCustomizedConverter()});
           break;
         default:
           throw new IllegalArgumentException("Unknown converter: " + name);

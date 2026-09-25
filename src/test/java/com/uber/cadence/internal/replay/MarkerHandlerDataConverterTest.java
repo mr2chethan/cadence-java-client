@@ -17,9 +17,11 @@
 
 package com.uber.cadence.internal.replay;
 
+import static com.uber.cadence.converter.JacksonDataConverterTest.newCustomizedConverter;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
@@ -36,10 +38,12 @@ import com.uber.cadence.MarkerRecordedEventAttributes;
 import com.uber.cadence.converter.DataConverter;
 import com.uber.cadence.converter.JacksonDataConverter;
 import com.uber.cadence.converter.JsonDataConverter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -51,6 +55,8 @@ import org.mockito.ArgumentCaptor;
  */
 @RunWith(Parameterized.class)
 public class MarkerHandlerDataConverterTest {
+
+  private static final String HEADER_KEY = "MutableMarkerHeader";
 
   private final DataConverter converter;
 
@@ -72,6 +78,7 @@ public class MarkerHandlerDataConverterTest {
           break;
         case "jackson":
           result.add(new Object[] {name, JacksonDataConverter.getInstance()});
+          result.add(new Object[] {"jackson-customized", newCustomizedConverter()});
           break;
         default:
           throw new IllegalArgumentException("Unknown converter: " + name);
@@ -159,6 +166,37 @@ public class MarkerHandlerDataConverterTest {
         converter.fromData(replayed.getStoredData().get(), Integer.class, Integer.class));
     verify(replayDecisions)
         .recordMarker(eq(ClockDecisionContext.VERSION_MARKER_NAME), any(Header.class), eq(version));
+  }
+
+  /** A header and details with a property this version does not know, as a newer client writes. */
+  @Test
+  public void testUnknownPropertiesAreIgnored() {
+    String unknown = "unknown" + UUID.randomUUID().toString().replace("-", "");
+    Header header = new Header();
+    header
+        .getFields()
+        .put(
+            HEADER_KEY,
+            ("{\"id\":\"cid1\",\"eventId\":5,\"accessCount\":0,\"" + unknown + "\":[1]}")
+                .getBytes(StandardCharsets.UTF_8));
+    byte[] details =
+        ("{\"id\":\"cid2\",\"eventId\":6,\"data\":null,\"accessCount\":1,\"" + unknown + "\":{}}")
+            .getBytes(StandardCharsets.UTF_8);
+
+    MarkerHandler.MarkerInterface fromHeader =
+        MarkerHandler.MarkerInterface.fromEventAttributes(
+            markerAttributes(header, null), converter);
+    MarkerHandler.MarkerInterface fromDetails =
+        MarkerHandler.MarkerInterface.fromEventAttributes(
+            markerAttributes(null, details), converter);
+
+    assertEquals("cid1", fromHeader.getId());
+    assertEquals(5L, fromHeader.getEventId());
+    assertEquals(0, fromHeader.getAccessCount());
+    assertEquals("cid2", fromDetails.getId());
+    assertEquals(6L, fromDetails.getEventId());
+    assertEquals(1, fromDetails.getAccessCount());
+    assertNull(fromDetails.getData());
   }
 
   private static MarkerRecordedEventAttributes markerAttributes(Header header, byte[] details) {

@@ -7,6 +7,7 @@
 - Fix JacksonDataConverter failing on the client's own records (getVersion, mutableSideEffect and local activity markers, retry options, shadowing heartbeats) and on empty payloads, and decoding a Set in hash order
 - Fix JacksonDataConverter losing the class, fields and message of exceptions
 - Fix JacksonDataConverter failing on classes without a no-arg constructor, and support Optional (adds the jackson-datatype-jdk8 dependency)
+- JacksonDataConverter rejects a mapper interceptor that returns another ObjectMapper, keeps its own copy of the mapper, writes and reads the client's own records with the default configuration whatever the customization, and supports default typing
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)

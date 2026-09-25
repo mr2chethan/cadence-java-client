@@ -40,6 +40,8 @@ import com.fasterxml.jackson.databind.deser.Deserializers;
 import com.fasterxml.jackson.databind.deser.ValueInstantiator;
 import com.fasterxml.jackson.databind.deser.ValueInstantiators;
 import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+import com.fasterxml.jackson.databind.jsontype.TypeDeserializer;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -121,12 +123,16 @@ import org.slf4j.LoggerFactory;
  *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
  *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
  * </ul>
+ *
+ * <p>Default typing ({@code ObjectMapper.activateDefaultTyping}) is supported, also for the types
+ * that this converter handles itself, such as exceptions and DataConverter fields, and for several
+ * values, such as the arguments of a workflow method. Enabling it on a domain with open workflows
+ * makes the untyped JSON they recorded unreadable for non-final types.
  */
 public final class JacksonDataConverter implements DataConverter {
 
   private static final Logger log = LoggerFactory.getLogger(JacksonDataConverter.class);
 
-  private static final DataConverter INSTANCE = new JacksonDataConverter();
   private static final Object[] EMPTY_OBJECT_ARRAY = new Object[0];
   private static final String TYPE_FIELD_NAME = "type";
   private static final String JSON_CONVERTER_TYPE = "JSON";
@@ -175,6 +181,17 @@ public final class JacksonDataConverter implements DataConverter {
         }
       };
 
+  /**
+   * Writes and reads the data that the client records for itself (see {@link ClientPayloads}), so
+   * that no customization of the ObjectMapper can change or break it. Never exposed.
+   */
+  private static final ObjectMapper CLIENT_PAYLOAD_MAPPER = newDefaultObjectMapper();
+
+  /** Holds the singleton, so that it is created after all static fields of this class. */
+  private static final class InstanceHolder {
+    static final DataConverter INSTANCE = new JacksonDataConverter();
+  }
+
   private final ObjectMapper objectMapper;
 
   /**
@@ -182,7 +199,7 @@ public final class JacksonDataConverter implements DataConverter {
    * ObjectMapper}.
    */
   public static DataConverter getInstance() {
-    return INSTANCE;
+    return InstanceHolder.INSTANCE;
   }
 
   private JacksonDataConverter() {
@@ -190,15 +207,53 @@ public final class JacksonDataConverter implements DataConverter {
   }
 
   /**
-   * Constructs an instance giving an ability to override {@link ObjectMapper} initialization.
+   * Constructs an instance with a customized {@link ObjectMapper}.
    *
-   * @param mapperInterceptor function that intercepts {@link ObjectMapper} construction. The
-   *     interceptor receives an already-configured ObjectMapper and must return the mapper to use
-   *     (may be the same instance, mutated in-place, or a new one).
+   * <p>{@code mapperInterceptor} receives a new ObjectMapper that already has the configuration
+   * this converter needs: its handling of exceptions, java.time and Optional values, Sets and
+   * classes without a usable constructor. The interceptor configures that mapper, for example by
+   * registering modules or changing features, and returns it, or a {@link ObjectMapper#copy() copy}
+   * of it. Modules it registers take precedence over the configuration of this converter. It must
+   * not return another ObjectMapper, such as one shared by the application: apply the settings of
+   * that mapper to the given one instead, for example by registering the same modules.
+   *
+   * <p>The converter keeps its own copy of the returned mapper. Changes made to the mapper after
+   * this constructor returns have no effect on the converter.
+   *
+   * <p>The customization applies to the values of workflows, activities, signals and queries and to
+   * the fields of exceptions. It does not apply to the data the client records for itself, such as
+   * the headers of version and local activity markers and the retry options of {@code
+   * Workflow.retry}, which are always written and read with the default configuration.
+   *
+   * @param mapperInterceptor configures the given ObjectMapper and returns it, or a copy of it
+   * @throws IllegalArgumentException if {@code mapperInterceptor} returns null or another
+   *     ObjectMapper
    */
   public JacksonDataConverter(Function<ObjectMapper, ObjectMapper> mapperInterceptor) {
-    ObjectMapper mapper = newDefaultObjectMapper();
-    this.objectMapper = mapperInterceptor.apply(mapper);
+    ObjectMapper configured = mapperInterceptor.apply(newDefaultObjectMapper());
+    if (configured == null || !configured.getRegisteredModuleIds().contains(CadenceModule.ID)) {
+      throw new IllegalArgumentException(
+          "mapperInterceptor must return the ObjectMapper it was given, or a copy() of it, after"
+              + " configuring it. The returned ObjectMapper lacks the configuration of"
+              + " JacksonDataConverter for exceptions, java.time and Optional values, Sets and"
+              + " classes without a usable constructor. To use the settings of another"
+              + " ObjectMapper, apply them to the given one, for example by registering the same"
+              + " modules.");
+    }
+    // Changes made later through a reference kept by the interceptor do not affect this converter.
+    this.objectMapper = configured.copy();
+  }
+
+  /** The mapper for a single value of the type: client payloads have their own. */
+  private ObjectMapper mapperFor(Type type) {
+    if (type == null) {
+      return objectMapper;
+    }
+    Class<?> raw =
+        type instanceof Class
+            ? (Class<?>) type
+            : objectMapper.getTypeFactory().constructType(type).getRawClass();
+    return ClientPayloads.isClientPayload(raw) ? CLIENT_PAYLOAD_MAPPER : objectMapper;
   }
 
   private static ObjectMapper newDefaultObjectMapper() {
@@ -252,11 +307,21 @@ public final class JacksonDataConverter implements DataConverter {
       if (values.length == 1) {
         // The registered ThrowableSerializer handles Throwables automatically,
         // so no special-casing needed here.
-        String json = objectMapper.writeValueAsString(values[0]);
+        Object value = values[0];
+        String json = mapperFor(value == null ? null : value.getClass()).writeValueAsString(value);
         return json.getBytes(StandardCharsets.UTF_8);
       }
-      String json = objectMapper.writeValueAsString(values);
-      return json.getBytes(StandardCharsets.UTF_8);
+      // Each value is written on its own like a single value, so that with default typing the
+      // array itself gets no type id: fromDataArray reads its elements by position.
+      StringWriter json = new StringWriter();
+      try (JsonGenerator generator = objectMapper.getFactory().createGenerator(json)) {
+        generator.writeStartArray();
+        for (Object value : values) {
+          objectMapper.writeValue(generator, value);
+        }
+        generator.writeEndArray();
+      }
+      return json.toString().getBytes(StandardCharsets.UTF_8);
     } catch (DataConverterException e) {
       throw e;
     } catch (Throwable e) {
@@ -272,8 +337,9 @@ public final class JacksonDataConverter implements DataConverter {
       return null;
     }
     try {
-      JavaType javaType = objectMapper.getTypeFactory().constructType(valueType);
-      return objectMapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
+      ObjectMapper mapper = mapperFor(valueType);
+      JavaType javaType = mapper.getTypeFactory().constructType(valueType);
+      return mapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
     } catch (Exception e) {
       throw new DataConverterException(content, new Type[] {valueType}, e);
     }
@@ -299,9 +365,9 @@ public final class JacksonDataConverter implements DataConverter {
         return result;
       }
       if (valueTypes.length == 1) {
-        JavaType javaType = objectMapper.getTypeFactory().constructType(valueTypes[0]);
-        Object result =
-            objectMapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
+        ObjectMapper mapper = mapperFor(valueTypes[0]);
+        JavaType javaType = mapper.getTypeFactory().constructType(valueTypes[0]);
+        Object result = mapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
         return new Object[] {result};
       }
 
@@ -759,8 +825,11 @@ public final class JacksonDataConverter implements DataConverter {
    */
   private static final class CadenceModule extends SimpleModule {
 
+    /** A unique id: Jackson ignores a module registered under an id it has already seen. */
+    static final String ID = "com.uber.cadence.converter.JacksonDataConverter.CadenceModule";
+
     CadenceModule(ObjectMapper mapper) {
-      super("CadenceModule");
+      super(ID);
       addSerializer(DataConverter.class, new DataConverterSerializer());
       addDeserializer(DataConverter.class, new DataConverterDeserializer());
       addSerializer(Class.class, new ClassSerializer());
@@ -773,6 +842,12 @@ public final class JacksonDataConverter implements DataConverter {
       // behave differently on replay. JsonDataConverter uses LinkedHashSet as well.
       addAbstractTypeMapping(Set.class, LinkedHashSet.class);
       addAbstractTypeMapping(AbstractSet.class, LinkedHashSet.class);
+    }
+
+    /** The same id whichever way the Jackson version in use derives the id of a SimpleModule. */
+    @Override
+    public Object getTypeId() {
+      return ID;
     }
 
     @Override
@@ -823,6 +898,17 @@ public final class JacksonDataConverter implements DataConverter {
       gen.writeStringField(TYPE_FIELD_NAME, JSON_CONVERTER_TYPE);
       gen.writeEndObject();
     }
+
+    /** Written without a type id, also with default typing. */
+    @Override
+    public void serializeWithType(
+        DataConverter value,
+        JsonGenerator gen,
+        SerializerProvider serializers,
+        TypeSerializer typeSer)
+        throws IOException {
+      serialize(value, gen, serializers);
+    }
   }
 
   /** Deserializes DataConverter fields, returning the JacksonDataConverter singleton. */
@@ -840,6 +926,14 @@ public final class JacksonDataConverter implements DataConverter {
             "Cannot deserialize DataConverter. Expected type is JSON. Found " + value);
       }
       return JacksonDataConverter.getInstance();
+    }
+
+    /** Read without a type id, also with default typing. */
+    @Override
+    public Object deserializeWithType(
+        JsonParser p, DeserializationContext ctxt, TypeDeserializer typeDeserializer)
+        throws IOException {
+      return deserialize(p, ctxt);
     }
   }
 
@@ -895,6 +989,14 @@ public final class JacksonDataConverter implements DataConverter {
       JsonNode node = throwableToJsonNode(value, active);
       gen.writeTree(node);
     }
+
+    /** The "class" field identifies the exception class, also with default typing. */
+    @Override
+    public void serializeWithType(
+        Throwable value, JsonGenerator gen, SerializerProvider provider, TypeSerializer typeSer)
+        throws IOException {
+      serialize(value, gen, provider);
+    }
   }
 
   /**
@@ -926,6 +1028,14 @@ public final class JacksonDataConverter implements DataConverter {
             Throwable.class, "Expected JSON object for Throwable, found %s", node.getNodeType());
       }
       return throwableFromJsonNode((ObjectNode) node, ctxt);
+    }
+
+    /** The "class" field identifies the exception class, also with default typing. */
+    @Override
+    public Object deserializeWithType(
+        JsonParser p, DeserializationContext ctxt, TypeDeserializer typeDeserializer)
+        throws IOException {
+      return deserialize(p, ctxt);
     }
 
     @Override
