@@ -19,6 +19,8 @@ package com.uber.cadence.workflow;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
@@ -41,18 +43,35 @@ import com.uber.cadence.internal.common.WorkflowExecutionUtils;
 import com.uber.cadence.testUtils.TestEnvironment;
 import com.uber.cadence.testing.TestEnvironmentOptions;
 import com.uber.cadence.testing.TestWorkflowEnvironment;
+import com.uber.cadence.testing.WorkflowReplayer;
 import com.uber.cadence.worker.Worker;
 import com.uber.cadence.worker.WorkerFactoryOptions;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.Period;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.GregorianCalendar;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.function.ThrowingRunnable;
 import org.junit.rules.ExternalResource;
 import org.junit.rules.RuleChain;
 import org.junit.rules.Timeout;
@@ -64,7 +83,9 @@ import org.junit.rules.Timeout;
  * JacksonDataConverter decodes differently fails the replay.
  *
  * <p>The histories are recorded at test time when JsonDataConverter can convert java.time values
- * (JDK 15 and earlier, or java.base/java.time opened to it).
+ * (JDK 15 and earlier, or java.base/java.time opened to it). The same workflows are also replayed
+ * from histories checked in as resources, which were recorded with JsonDataConverter on JDK 11 in
+ * the UTC time zone, so that this is tested on every JVM.
  */
 public class JacksonMigrationReplayTest {
 
@@ -94,11 +115,77 @@ public class JacksonMigrationReplayTest {
   }
 
   @Test
+  public void testReplayJavaTimeHistoryRecordedWithGson() throws Exception {
+    assumeGsonCanConvertJavaTime();
+    WorkflowExecutionHistory history = recordWithGson(Recording.JAVA_TIME);
+    replay(JacksonDataConverter.getInstance(), history);
+  }
+
+  @Test
+  public void testReplayUntypedNumbersHistoryRecordedWithGson() throws Exception {
+    WorkflowExecutionHistory history = recordWithGson(Recording.UNTYPED_NUMBERS);
+    assertReplayFails(() -> replay(JacksonDataConverter.getInstance(), history));
+    replay(withGsonCompatibleNumbers(), history);
+  }
+
+  @Test
   public void testReplayClientPayloadsHistoryRecordedWithGson() throws Exception {
     assumeGsonCanConvertJavaTime();
     WorkflowExecutionHistory history = recordWithGson(Recording.CLIENT_PAYLOADS);
     replay(JacksonDataConverter.getInstance(), history);
     replay(customized(), history);
+  }
+
+  @Test
+  public void testReplayCheckedInJavaTimeHistory() throws Exception {
+    WorkflowExecutionHistory history =
+        WorkflowExecutionUtils.readHistoryFromResource(Recording.JAVA_TIME.resource);
+    String input =
+        new String(
+            history.getEvents().get(0).getWorkflowExecutionStartedEventAttributes().getInput(),
+            StandardCharsets.UTF_8);
+    // What JsonDataConverter writes through reflection and its own adapters.
+    assertTrue(input, input.contains("{\"year\":2024,\"month\":2,\"day\":29}"));
+    assertTrue(input, input.contains("{\"seconds\":1700000000,\"nanos\":5}"));
+    assertTrue(input, input.contains("\"Nov 14, 2023, 10:13:20 PM\""));
+    assertTrue(input, input.contains("{\"value\":\"hello\"}"));
+
+    TimeZone defaultZone = TimeZone.getDefault();
+    // JsonDataConverter wrote the Date in the time zone of the JVM that recorded the history.
+    TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
+    try {
+      WorkflowReplayer.replayWorkflowExecutionFromResource(
+          Recording.JAVA_TIME.resource, JacksonDataConverter.getInstance(), TimeWorkflowImpl.class);
+    } finally {
+      TimeZone.setDefault(defaultZone);
+    }
+  }
+
+  @Test
+  public void testReplayCheckedInUntypedNumbersHistory() throws Exception {
+    assertReplayFails(
+        () ->
+            WorkflowReplayer.replayWorkflowExecutionFromResource(
+                Recording.UNTYPED_NUMBERS.resource,
+                JacksonDataConverter.getInstance(),
+                NumbersWorkflowImpl.class));
+    WorkflowReplayer.replayWorkflowExecutionFromResource(
+        Recording.UNTYPED_NUMBERS.resource, withGsonCompatibleNumbers(), NumbersWorkflowImpl.class);
+  }
+
+  /**
+   * The workflow casts untyped numbers to Double, which JacksonDataConverter decodes as Integer by
+   * default. It fails, and does not schedule the activity that the history holds, which the replay
+   * reports as nondeterminism.
+   */
+  private static void assertReplayFails(ThrowingRunnable replay) {
+    RuntimeException e = assertThrows(RuntimeException.class, replay);
+    assertTrue(e.getMessage(), e.getMessage().contains("nondeterministic"));
+  }
+
+  private static DataConverter withGsonCompatibleNumbers() {
+    return new JacksonDataConverter(
+        mapper -> mapper.registerModule(JacksonDataConverter.gsonCompatibleNumbersModule()));
   }
 
   /** A customization that does not apply to the data the client records for itself. */
@@ -132,7 +219,8 @@ public class JacksonMigrationReplayTest {
     TestWorkflowEnvironment environment = newEnvironment(converter);
     environments.add(environment);
     Worker worker = environment.newWorker(TASK_LIST);
-    worker.registerWorkflowImplementationTypes(ClientPayloadsWorkflowImpl.class);
+    worker.registerWorkflowImplementationTypes(
+        TimeWorkflowImpl.class, NumbersWorkflowImpl.class, ClientPayloadsWorkflowImpl.class);
     worker.replayWorkflowExecution(history);
   }
 
@@ -151,7 +239,8 @@ public class JacksonMigrationReplayTest {
   static WorkflowExecutionHistory record(TestWorkflowEnvironment environment, Recording recording)
       throws TimeoutException {
     Worker worker = environment.newWorker(TASK_LIST);
-    worker.registerWorkflowImplementationTypes(ClientPayloadsWorkflowImpl.class);
+    worker.registerWorkflowImplementationTypes(
+        TimeWorkflowImpl.class, NumbersWorkflowImpl.class, ClientPayloadsWorkflowImpl.class);
     worker.registerActivitiesImplementations(new MigrationActivitiesImpl());
     environment.start();
     WorkflowStub workflow =
@@ -170,20 +259,50 @@ public class JacksonMigrationReplayTest {
     return new WorkflowExecutionHistory(events);
   }
 
-  /** The recorded workflows. */
+  /** The recorded workflows, and the resources their histories recorded with Gson are in. */
   enum Recording {
+    JAVA_TIME(
+        "testGsonJavaTimeHistory.json",
+        "day=2024-02-29 at=2023-11-14T22:13:20.000000005Z when=1700000000000"
+            + " calendar=2024-02-29 10:30:15 note=Optional[hello] next=2024-03-01"
+            + " later=1700000060000 timeout=PT1M30.000000005S"
+            + " slot=2024-03-01T10:30/P3D/OptionalInt[4] shout=Optional[HELLO]"),
+    UNTYPED_NUMBERS(
+        "testGsonUntypedNumbersHistory.json", "count=3.0 first=1.0 ratio=0.5 total=12.0 unit=kg"),
     CLIENT_PAYLOADS(
+        null,
         "v1 once-ok(c-1) 7/7 twice-ok(c-1) QuotaException: storage over quota 5 [storage/5] v1");
 
+    final String resource;
     final String expected;
 
-    Recording(String expected) {
+    Recording(String resource, String expected) {
+      this.resource = resource;
       this.expected = expected;
     }
 
     /** Starts the workflow and returns its stub. */
     Object start(WorkflowClient client) {
       switch (this) {
+        case JAVA_TIME:
+          TimeWorkflow time = client.newWorkflowStub(TimeWorkflow.class);
+          WorkflowClient.start(
+              time::run,
+              expected,
+              LocalDate.of(2024, 2, 29),
+              Instant.ofEpochSecond(1_700_000_000L, 5),
+              new Date(1_700_000_000_000L),
+              new GregorianCalendar(2024, Calendar.FEBRUARY, 29, 10, 30, 15),
+              Optional.of("hello"));
+          return time;
+        case UNTYPED_NUMBERS:
+          Map<String, Object> attributes = new LinkedHashMap<>();
+          attributes.put("count", 3);
+          attributes.put("sizes", Arrays.asList(1, 2));
+          attributes.put("ratio", 0.5);
+          NumbersWorkflow numbers = client.newWorkflowStub(NumbersWorkflow.class);
+          WorkflowClient.start(numbers::run, expected, attributes);
+          return numbers;
         case CLIENT_PAYLOADS:
           ClientPayloadsWorkflow payloads = client.newWorkflowStub(ClientPayloadsWorkflow.class);
           WorkflowClient.start(payloads::run, expected, "c-1");
@@ -214,6 +333,27 @@ public class JacksonMigrationReplayTest {
     return new RetryOptions.Builder().setInitialInterval(initialInterval).setMaximumAttempts(3);
   }
 
+  public static final class Slot {
+    private final LocalDateTime start;
+    private final Period length;
+    private final OptionalInt seats;
+
+    public Slot(LocalDateTime start, Period length, OptionalInt seats) {
+      this.start = start;
+      this.length = length;
+      this.seats = seats;
+    }
+
+    Slot next() {
+      return new Slot(start.plusDays(1), length.plusDays(1), OptionalInt.of(seats.getAsInt() + 1));
+    }
+
+    @Override
+    public String toString() {
+      return start + "/" + length + "/" + seats;
+    }
+  }
+
   /** Has only a constructor with several arguments. */
   public static class QuotaException extends RuntimeException {
     private final String resource;
@@ -232,6 +372,18 @@ public class JacksonMigrationReplayTest {
   }
 
   public interface MigrationActivities {
+    LocalDate nextDay(LocalDate day);
+
+    Date later(Date when);
+
+    Duration timeout();
+
+    Slot reschedule(Slot slot);
+
+    Optional<String> shout(Optional<String> note);
+
+    Map<String, Object> stats();
+
     String failOnce(String id);
 
     String failTwice(String id);
@@ -244,6 +396,39 @@ public class JacksonMigrationReplayTest {
   public static class MigrationActivitiesImpl implements MigrationActivities {
     private final AtomicInteger failOnceCalls = new AtomicInteger();
     private final AtomicInteger failTwiceCalls = new AtomicInteger();
+
+    @Override
+    public LocalDate nextDay(LocalDate day) {
+      return day.plusDays(1);
+    }
+
+    @Override
+    public Date later(Date when) {
+      return new Date(when.getTime() + 60_000);
+    }
+
+    @Override
+    public Duration timeout() {
+      return Duration.ofSeconds(90, 5);
+    }
+
+    @Override
+    public Slot reschedule(Slot slot) {
+      return slot.next();
+    }
+
+    @Override
+    public Optional<String> shout(Optional<String> note) {
+      return note.map(value -> value.toUpperCase(Locale.ROOT));
+    }
+
+    @Override
+    public Map<String, Object> stats() {
+      Map<String, Object> stats = new LinkedHashMap<>();
+      stats.put("total", 12);
+      stats.put("unit", "kg");
+      return stats;
+    }
 
     @Override
     public String failOnce(String id) {
@@ -269,6 +454,80 @@ public class JacksonMigrationReplayTest {
     @Override
     public String report(String description) {
       return description;
+    }
+  }
+
+  public interface TimeWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    String run(
+        String expected,
+        LocalDate day,
+        Instant at,
+        Date when,
+        Calendar calendar,
+        Optional<String> note);
+  }
+
+  public static class TimeWorkflowImpl implements TimeWorkflow {
+    @Override
+    public String run(
+        String expected,
+        LocalDate day,
+        Instant at,
+        Date when,
+        Calendar calendar,
+        Optional<String> note) {
+      MigrationActivities activities = activities();
+      Slot slot = new Slot(day.atTime(10, 30), Period.ofDays(2), OptionalInt.of(3));
+      String actual =
+          String.join(
+              " ",
+              "day=" + day,
+              "at=" + at,
+              "when=" + when.getTime(),
+              String.format(Locale.ROOT, "calendar=%tF %<tT", calendar),
+              "note=" + note,
+              "next=" + activities.nextDay(day),
+              "later=" + activities.later(when).getTime(),
+              "timeout=" + activities.timeout(),
+              "slot=" + activities.reschedule(slot),
+              "shout=" + activities.shout(note));
+      return complete(expected, actual);
+    }
+  }
+
+  public interface NumbersWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    String run(String expected, Map<String, Object> attributes);
+  }
+
+  /** Written for JsonDataConverter, which decodes untyped numbers as Double. */
+  public static class NumbersWorkflowImpl implements NumbersWorkflow {
+    @Override
+    public String run(String expected, Map<String, Object> attributes) {
+      double count = (Double) attributes.get("count");
+      double first = (Double) ((List<?>) attributes.get("sizes")).get(0);
+      double ratio = (Double) attributes.get("ratio");
+      Map<String, Object> stats = activities().stats();
+      double total = (Double) stats.get("total");
+      String actual =
+          "count="
+              + count
+              + " first="
+              + first
+              + " ratio="
+              + ratio
+              + " total="
+              + total
+              + " unit="
+              + stats.get("unit");
+      return complete(expected, actual);
     }
   }
 

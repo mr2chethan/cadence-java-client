@@ -10,6 +10,7 @@
 - JacksonDataConverter rejects a mapper interceptor that returns another ObjectMapper, keeps its own copy of the mapper, writes and reads the client's own records with the default configuration whatever the customization, and supports default typing
 - Add WorkflowReplayer methods that replay with a given DataConverter
 - JacksonDataConverter writes the Durations of the client's own records (local activity markers, retry options) in the form JsonDataConverter reads, and reads Durations in both forms
+- JacksonDataConverter reads what JsonDataConverter wrote, and adds gsonCompatibleNumbersModule() to decode untyped numbers as Double like Gson. Switching back is not supported for open workflows; see its javadoc
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)

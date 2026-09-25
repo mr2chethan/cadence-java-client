@@ -125,6 +125,10 @@ import org.slf4j.LoggerFactory;
  *       remaining ones their default value), like {@link JsonDataConverter}.
  *   <li>An abstract {@link Set} is decoded as an insertion-ordered {@link LinkedHashSet}.
  *   <li>{@link Optional} values are written as the contained value, or null when empty.
+ *   <li>Numbers in untyped values (Object, the values of a {@code Map<String, Object>}, the
+ *       elements of a {@code List<Object>}) are decoded as Integer, Long, BigInteger or Double,
+ *       where {@link JsonDataConverter} always gives Double. Register {@link
+ *       #gsonCompatibleNumbersModule()} for Double.
  *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
  *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
  * </ul>
@@ -137,6 +141,16 @@ import org.slf4j.LoggerFactory;
  *       converter. Switch only for new domains or task lists, after the open workflows complete, or
  *       for new code paths behind {@code Workflow.getVersion}, unless you verified the replay of
  *       your open histories with this converter.
+ *   <li>This converter reads what {@link JsonDataConverter} writes for java.time values (the form
+ *       Gson writes on JDK 15 and earlier), java.util.Date, java.sql.Date, java.sql.Time and
+ *       java.sql.Timestamp strings, Calendar, Duration, Optional (except when its content is a map,
+ *       an interface, an untyped value or a class with a "value" property: such an Optional is read
+ *       in the form this converter writes, so Gson's {@code {"value":x}} is then read as a map or
+ *       fails), OptionalInt, OptionalLong, OptionalDouble and byte arrays. It does not read what
+ *       Gson could not read either, such as ZonedDateTime. A deserializer of your own that you
+ *       register for one of these types replaces this. Registering Jackson's own JavaTimeModule or
+ *       Jdk8Module does not.
+ *   <li>Code that casts untyped numbers to Double needs {@link #gsonCompatibleNumbersModule()}.
  *   <li>{@link JsonDataConverter} reads the data that the client records for itself with this
  *       converter, such as the headers of markers and the retry options of {@code Workflow.retry},
  *       on JDK 15 and earlier or with {@code --add-opens java.base/java.time}. It does not read
@@ -253,6 +267,9 @@ public final class JacksonDataConverter implements DataConverter {
    * Durations of these retry options are always written as {@code {"seconds":..,"nanos":..}}, also
    * inside other values.
    *
+   * <p>For example, to decode untyped numbers as Double like {@link JsonDataConverter}: {@code new
+   * JacksonDataConverter(mapper -> mapper.registerModule(gsonCompatibleNumbersModule()))}.
+   *
    * @param mapperInterceptor configures the given ObjectMapper and returns it, or a copy of it
    * @throws IllegalArgumentException if {@code mapperInterceptor} returns null or another
    *     ObjectMapper
@@ -270,6 +287,16 @@ public final class JacksonDataConverter implements DataConverter {
     }
     // Changes made later through a reference kept by the interceptor do not affect this converter.
     this.objectMapper = configured.copy();
+  }
+
+  /**
+   * Returns a module that decodes the numbers of untyped values (Object, the values of a {@code
+   * Map<String, Object>}, the elements of a {@code List<Object>}) as Double, like {@link
+   * JsonDataConverter}, for code written for it. Register it through {@link
+   * #JacksonDataConverter(Function)}.
+   */
+  public static Module gsonCompatibleNumbersModule() {
+    return GsonCompatibility.untypedNumbersModule();
   }
 
   /** The mapper for a single value of the type: client payloads have their own. */
@@ -886,6 +913,7 @@ public final class JacksonDataConverter implements DataConverter {
       context.addDeserializers(new ThrowableDeserializers());
       // Reads what JsonDataConverter wrote, and writes the Durations of the client's own data so
       // that JsonDataConverter can read them.
+      context.addBeanDeserializerModifier(new GsonCompatibility.ReadModifier());
       context.addBeanDeserializerModifier(new GsonCompatibility.InternalPayloadReadModifier());
       context.addBeanSerializerModifier(new GsonCompatibility.InternalPayloadWriteModifier());
     }
