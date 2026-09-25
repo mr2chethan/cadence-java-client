@@ -30,14 +30,33 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonValue;
 import com.fasterxml.jackson.core.Version;
+import com.fasterxml.jackson.core.json.JsonReadFeature;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.introspect.AnnotationIntrospectorPair;
 import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.databind.node.BinaryNode;
+import com.fasterxml.jackson.databind.node.POJONode;
+import com.fasterxml.jackson.databind.util.TokenBuffer;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
 import com.google.gson.annotations.SerializedName;
+import com.google.gson.reflect.TypeToken;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -47,10 +66,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
-/** JacksonDataConverter applies Gson's annotations like JsonDataConverter. */
+/**
+ * JacksonDataConverter applies Gson's annotations and writes Gson's tree types like
+ * JsonDataConverter.
+ */
 public class JacksonDataConverterGsonAnnotationsTest {
 
   private static final DataConverter GSON = JsonDataConverter.getInstance();
@@ -604,6 +628,363 @@ public class JacksonDataConverterGsonAnnotationsTest {
     assertEquals(Color.VIOLET, read(converter, "\"gson_violet\"", Color.class));
   }
 
+  // ---------- Gson's tree types ----------
+
+  /** Numbers as JsonDataConverter writes them when they were parsed by Gson. */
+  private static final String NUMBERS =
+      "[0,-7,123456789012345678901234567890,1e400,-0.0,1.50,0.0000001,9223372036854775807,"
+          + "-9223372036854775808,9223372036854775808,3.14159265358979323846264338327950288,2E-3]";
+
+  /** A Number whose text is not a JSON number. */
+  static final class HexNumber extends Number {
+    @Override
+    public int intValue() {
+      return 42;
+    }
+
+    @Override
+    public long longValue() {
+      return 42;
+    }
+
+    @Override
+    public float floatValue() {
+      return 42;
+    }
+
+    @Override
+    public double doubleValue() {
+      return 42;
+    }
+
+    @Override
+    public String toString() {
+      return "0x2A";
+    }
+  }
+
+  @Test
+  public void jsonElementTopLevelRoundTrips() {
+    List<JsonElement> values =
+        Arrays.asList(
+            tree("{\"a\":1,\"b\":[true,null,\"s\"],\"c\":{},\"d\":[]}"),
+            tree("[1,\"two\",[3],{\"four\":4.5},null]"),
+            new JsonPrimitive("text"),
+            new JsonPrimitive(true),
+            new JsonPrimitive(false),
+            new JsonPrimitive(12),
+            tree("-2.50"));
+    for (JsonElement value : values) {
+      Class<? extends JsonElement> type = value.getClass();
+      byte[] jackson = JACKSON.toData(value);
+      assertEquals(text(GSON.toData(value)), text(jackson));
+      assertEquals(value, JACKSON.fromData(jackson, type, type));
+      assertEquals(type, JACKSON.fromData(jackson, type, type).getClass());
+      assertEquals(value, JACKSON.fromData(jackson, JsonElement.class, JsonElement.class));
+      assertEquals(value, GSON.fromData(jackson, type, type));
+    }
+  }
+
+  @Test
+  public void jsonElementNumbersKeepGsonText() {
+    JsonElement parsed = tree(NUMBERS);
+    assertEquals(NUMBERS, text(GSON.toData(parsed)));
+    assertEquals(NUMBERS, text(JACKSON.toData(parsed)));
+
+    JsonArray read = JACKSON.fromData(utf8(NUMBERS), JsonArray.class, JsonArray.class);
+    assertEquals(parsed, read);
+    assertEquals(NUMBERS, text(GSON.toData(read)));
+    assertEquals(NUMBERS, text(JACKSON.toData(read)));
+
+    JsonArray built = new JsonArray();
+    built.add(1);
+    built.add(Long.MAX_VALUE);
+    built.add((short) 3);
+    built.add((byte) 4);
+    built.add(2.5d);
+    built.add(1.5f);
+    built.add(1e-7);
+    built.add(new BigInteger("123456789012345678901234567890"));
+    built.add(new BigDecimal("1.10"));
+    built.add(new AtomicInteger(7));
+    String expected =
+        "[1,9223372036854775807,3,4,2.5,1.5,1.0E-7,123456789012345678901234567890,1.10,7]";
+    assertEquals(expected, text(GSON.toData(built)));
+    assertEquals(expected, text(JACKSON.toData(built)));
+
+    // JsonDataConverter rejects it, JacksonDataConverter writes its double value.
+    assertEquals("42.0", text(JACKSON.toData(new JsonPrimitive(new HexNumber()))));
+  }
+
+  @Test
+  public void nonStandardNumbersAllowedByTheMapperAreRead() {
+    DataConverter converter =
+        new JacksonDataConverter(
+            mapper -> mapper.enable(JsonReadFeature.ALLOW_NON_NUMERIC_NUMBERS.mappedFeature()));
+    JsonArray result =
+        converter.fromData(utf8("[NaN,-Infinity,2]"), JsonArray.class, JsonArray.class);
+    assertTrue(Double.isNaN(result.get(0).getAsDouble()));
+    assertEquals(Double.NEGATIVE_INFINITY, result.get(1).getAsDouble(), 0);
+    assertEquals(2, result.get(2).getAsInt());
+  }
+
+  public static class TreeHolder {
+    JsonObject object;
+    JsonArray array;
+    JsonPrimitive primitive;
+    JsonElement element;
+    JsonElement nullElement;
+    List<JsonObject> objects;
+    Map<String, JsonElement> byName;
+  }
+
+  private static void assertTrees(TreeHolder expected, TreeHolder actual) {
+    assertEquals(expected.object, actual.object);
+    assertEquals(expected.array, actual.array);
+    assertEquals(expected.primitive, actual.primitive);
+    assertEquals(expected.element, actual.element);
+    assertSame(JsonNull.INSTANCE, actual.nullElement);
+    assertEquals(expected.objects, actual.objects);
+    assertEquals(expected.byName, actual.byName);
+    assertSame(JsonNull.INSTANCE, actual.byName.get("none"));
+  }
+
+  public static class OptionalTree {
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    JsonElement extra;
+
+    String name;
+  }
+
+  @Test
+  public void jsonElementFieldsAndContainers() {
+    TreeHolder holder = new TreeHolder();
+    holder.object = tree("{\"a\":1.50,\"b\":{\"c\":[null]}}").getAsJsonObject();
+    holder.array = tree("[\"x\",-0.0,{}]").getAsJsonArray();
+    holder.primitive = new JsonPrimitive("p");
+    holder.element = tree("[123456789012345678901234567890]");
+    holder.objects = Arrays.asList(tree("{\"i\":1}").getAsJsonObject(), new JsonObject());
+    holder.byName = new LinkedHashMap<>();
+    holder.byName.put("none", JsonNull.INSTANCE);
+    holder.byName.put("one", new JsonPrimitive(1));
+    holder.byName.put("tree", tree("{\"t\":true}"));
+
+    byte[] jackson = JACKSON.toData(holder);
+    assertEquals(
+        "{\"object\":{\"a\":1.50,\"b\":{\"c\":[null]}},\"array\":[\"x\",-0.0,{}],"
+            + "\"primitive\":\"p\",\"element\":[123456789012345678901234567890],"
+            + "\"nullElement\":null,\"objects\":[{\"i\":1},{}],"
+            + "\"byName\":{\"none\":null,\"one\":1,\"tree\":{\"t\":true}}}",
+        text(jackson));
+    assertEquals(text(GSON.toData(holder)), text(jackson));
+
+    assertTrees(holder, JACKSON.fromData(jackson, TreeHolder.class, TreeHolder.class));
+    assertTrees(holder, GSON.fromData(jackson, TreeHolder.class, TreeHolder.class));
+
+    OptionalTree optional = new OptionalTree();
+    optional.name = "n";
+    optional.extra = JsonNull.INSTANCE;
+    assertEquals("{\"name\":\"n\"}", text(JACKSON.toData(optional)));
+    optional.extra = new JsonPrimitive(1);
+    assertEquals("{\"extra\":1,\"name\":\"n\"}", text(JACKSON.toData(optional)));
+  }
+
+  @Test
+  public void jsonNullIsReadLikeGson() {
+    assertEquals("null", text(JACKSON.toData(JsonNull.INSTANCE)));
+    assertEquals(text(GSON.toData(JsonNull.INSTANCE)), text(JACKSON.toData(JsonNull.INSTANCE)));
+    for (DataConverter converter : Arrays.asList(GSON, JACKSON)) {
+      assertSame(JsonNull.INSTANCE, read(converter, "null", JsonElement.class));
+    }
+    assertSame(JsonNull.INSTANCE, read(JACKSON, "null", JsonNull.class));
+    assertNull(read(JACKSON, "null", JsonObject.class));
+    assertNull(read(JACKSON, "null", JsonArray.class));
+    assertNull(read(JACKSON, "null", JsonPrimitive.class));
+
+    Type elements = new TypeToken<List<JsonElement>>() {}.getType();
+    List<?> list = JACKSON.fromData(utf8("[null,1]"), List.class, elements);
+    assertSame(JsonNull.INSTANCE, list.get(0));
+    Type objects = new TypeToken<List<JsonObject>>() {}.getType();
+    assertNull(JACKSON.fromData(utf8("[null,{}]"), List.class, objects).get(0));
+  }
+
+  @Test
+  public void jsonElementTypeMismatchFails() {
+    Map<String, Class<? extends JsonElement>> cases = new LinkedHashMap<>();
+    cases.put("[1,2]", JsonObject.class);
+    cases.put("{\"a\":1}", JsonArray.class);
+    cases.put("\"x\"", JsonArray.class);
+    cases.put("[1]", JsonPrimitive.class);
+    cases.put("1", JsonNull.class);
+    for (Map.Entry<String, Class<? extends JsonElement>> c : cases.entrySet()) {
+      DataConverterException e =
+          assertThrows(DataConverterException.class, () -> read(JACKSON, c.getKey(), c.getValue()));
+      String message = e.getCause().getMessage();
+      assertTrue(message, message.contains(c.getValue().getName()));
+    }
+    assertThrows(DataConverterException.class, () -> read(GSON, "[1,2]", JsonObject.class));
+  }
+
+  public static class DetailsException extends RuntimeException {
+    JsonObject details;
+
+    DetailsException(String message, JsonObject details) {
+      super(message);
+      this.details = details;
+    }
+  }
+
+  @Test
+  public void jsonElementInExceptionField() {
+    JsonObject details =
+        tree("{\"id\":7,\"big\":123456789012345678901234567890,\"min\":-9223372036854775808,"
+                + "\"over\":9223372036854775808,\"half\":2.5,\"flag\":true,\"none\":null,"
+                + "\"list\":[1,\"a\",{\"x\":[]}],\"text\":\"t\"}")
+            .getAsJsonObject();
+    DetailsException original = new DetailsException("failed", details);
+    byte[] jackson = JACKSON.toData(original);
+    byte[] gson = GSON.toData(original);
+    assertEquals(field(gson, "details"), field(jackson, "details"));
+    assertEquals(details.toString(), field(jackson, "details"));
+
+    for (Throwable result :
+        Arrays.asList(
+            JACKSON.fromData(jackson, Throwable.class, Throwable.class),
+            JACKSON.fromData(gson, Throwable.class, Throwable.class),
+            GSON.fromData(jackson, Throwable.class, Throwable.class))) {
+      assertEquals(DetailsException.class, result.getClass());
+      assertEquals("failed", result.getMessage());
+      assertEquals(details, ((DetailsException) result).details);
+    }
+  }
+
+  public static class TypedTrees {
+    JsonElement element;
+    JsonObject object;
+    JsonArray array;
+  }
+
+  @Test
+  public void jsonElementWithDefaultTyping() {
+    DataConverter converter =
+        new JacksonDataConverter(
+            mapper ->
+                mapper.activateDefaultTyping(
+                    BasicPolymorphicTypeValidator.builder().allowIfBaseType(Object.class).build(),
+                    ObjectMapper.DefaultTyping.NON_FINAL));
+    TypedTrees value = new TypedTrees();
+    value.element = tree("{\"k\":[1,2.50]}");
+    value.object = tree("{\"a\":null}").getAsJsonObject();
+    value.array = tree("[\"s\"]").getAsJsonArray();
+
+    byte[] data = converter.toData(value);
+    assertEquals(
+        "[\""
+            + TypedTrees.class.getName()
+            + "\",{\"element\":{\"k\":[1,2.50]},\"object\":{\"a\":null},\"array\":[\"s\"]}]",
+        text(data));
+    TypedTrees result = converter.fromData(data, TypedTrees.class, TypedTrees.class);
+    assertEquals(value.element, result.element);
+    assertEquals(value.object, result.object);
+    assertEquals(value.array, result.array);
+  }
+
+  public static class WrappedTree {
+    final JsonObject json;
+
+    @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+    WrappedTree(JsonObject json) {
+      this.json = json;
+    }
+
+    @JsonValue
+    JsonObject json() {
+      return json;
+    }
+  }
+
+  /** Jackson passes the content of the object to the creator, from its first property on. */
+  @Test
+  public void jsonObjectAsDelegatingCreatorArgument() {
+    String json = "{\"a\":1,\"b\":[1.50,{\"c\":null}]}";
+    JsonObject object = tree(json).getAsJsonObject();
+    byte[] data = JACKSON.toData(new WrappedTree(object));
+    assertEquals(json, text(data));
+    assertEquals(object, JACKSON.fromData(data, WrappedTree.class, WrappedTree.class).json);
+  }
+
+  /** Jackson passes the end of an empty object to the creator. */
+  @Test
+  public void emptyJsonObjectAsDelegatingCreatorArgument() {
+    WrappedTree wrapped = JACKSON.fromData(utf8("{}"), WrappedTree.class, WrappedTree.class);
+    assertEquals(new JsonObject(), wrapped.json);
+    assertEquals("{}", text(JACKSON.toData(wrapped)));
+  }
+
+  @Test
+  public void floatsKeepTheirDigits() {
+    JsonArray array = new JsonArray();
+    array.add(0.1f);
+    array.add(Float.MAX_VALUE);
+    array.add(0.1d);
+    assertEquals("[0.1,3.4028235E38,0.1]", text(JACKSON.toData(array)));
+    assertEquals(text(GSON.toData(array)), text(JACKSON.toData(array)));
+  }
+
+  public static class BytesHolder {
+    byte[] data = {1, 2, 3};
+  }
+
+  /**
+   * Values that the mapper holds as they are, as in convertValue, are not found in the JSON read by
+   * JacksonDataConverter itself.
+   */
+  @Test
+  public void embeddedValuesAreConverted() throws IOException {
+    ObjectMapper mapper = mapperGivenToInterceptor();
+    assertEquals(
+        tree("{\"data\":\"AQID\"}"), mapper.convertValue(new BytesHolder(), JsonObject.class));
+    assertEquals(
+        new JsonPrimitive("AQID"),
+        mapper.treeToValue(BinaryNode.valueOf(new byte[] {1, 2, 3}), JsonElement.class));
+    try (TokenBuffer buffer = new TokenBuffer(mapper, false)) {
+      buffer.writeEmbeddedObject(null);
+      assertSame(JsonNull.INSTANCE, mapper.readValue(buffer.asParser(), JsonElement.class));
+    }
+    assertThrows(
+        JsonMappingException.class,
+        () -> mapper.treeToValue(new POJONode(new StringBuilder("x")), JsonElement.class));
+  }
+
+  /** Numbers of a JsonElement that the mapper converts, as for the fields of exceptions. */
+  @Test
+  public void jsonElementNumbersInConvertedValues() {
+    ObjectMapper mapper = mapperGivenToInterceptor();
+    JsonElement parsed = tree("[7,-9223372036854775808,9223372036854775808,2.5,1e5,2E3,-0.0]");
+    JsonNode node = mapper.valueToTree(parsed);
+    assertEquals(7, node.get(0).longValue());
+    assertEquals(Long.MIN_VALUE, node.get(1).longValue());
+    assertTrue(node.get(2).isBigInteger());
+    assertEquals(new BigInteger("9223372036854775808"), node.get(2).bigIntegerValue());
+    assertEquals(0, new BigDecimal("2.5").compareTo(node.get(3).decimalValue()));
+    assertEquals(0, new BigDecimal("1e5").compareTo(node.get(4).decimalValue()));
+    assertEquals(0, new BigDecimal("2E3").compareTo(node.get(5).decimalValue()));
+    assertEquals(0, node.get(6).doubleValue(), 0);
+    assertEquals(parsed, mapper.convertValue(parsed, JsonArray.class));
+  }
+
+  private static ObjectMapper mapperGivenToInterceptor() {
+    AtomicReference<ObjectMapper> given = new AtomicReference<>();
+    DataConverter converter =
+        new JacksonDataConverter(
+            mapper -> {
+              given.set(mapper);
+              return mapper;
+            });
+    assertEquals("1", text(converter.toData(new JsonPrimitive(1))));
+    return given.get();
+  }
+
   // ---------- Helpers ----------
 
   private static byte[] utf8(String json) {
@@ -620,6 +1001,11 @@ public class JacksonDataConverterGsonAnnotationsTest {
 
   private static JsonElement tree(byte[] data) {
     return tree(text(data));
+  }
+
+  /** The JSON text of a field of a JSON object, with the numbers as written. */
+  private static String field(byte[] data, String name) {
+    return tree(data).getAsJsonObject().get(name).toString();
   }
 
   private static <T> T read(DataConverter converter, String json, Class<T> type) {

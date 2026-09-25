@@ -55,6 +55,7 @@ import com.fasterxml.jackson.datatype.jsr310.deser.DurationDeserializer;
 import com.google.common.base.Defaults;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.gson.JsonElement;
 import com.google.gson.annotations.SerializedName;
 import com.uber.cadence.client.ApplicationFailureException;
 import java.io.IOException;
@@ -135,10 +136,12 @@ import org.slf4j.LoggerFactory;
  *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
  * </ul>
  *
- * <p>Gson annotations: like {@link JsonDataConverter}, it applies Gson's {@code SerializedName}
- * (the name and alternate names of fields, including fields of exceptions, and of enum constants).
- * A non-empty name of a Jackson {@code JsonProperty} takes precedence over the name of {@code
- * SerializedName}, which is then still read. Gson's {@code JsonAdapter} is not supported.
+ * <p>Gson annotations and types: like {@link JsonDataConverter}, it applies Gson's {@code
+ * SerializedName} (the name and alternate names of fields, including fields of exceptions, and of
+ * enum constants), and it writes and reads Gson's JsonElement, JsonObject, JsonArray and
+ * JsonPrimitive as the JSON they represent. A non-empty name of a Jackson {@code JsonProperty}
+ * takes precedence over the name of {@code SerializedName}, which is then still read. Gson's {@code
+ * JsonAdapter} is not supported.
  *
  * <p>Migrating from {@link JsonDataConverter}:
  *
@@ -172,9 +175,10 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p>Default typing ({@code ObjectMapper.activateDefaultTyping}) is supported, also for the types
- * that this converter handles itself, such as exceptions and DataConverter fields, and for several
- * values, such as the arguments of a workflow method. Enabling it on a domain with open workflows
- * makes the untyped JSON they recorded unreadable for non-final types.
+ * that this converter handles itself, such as exceptions, DataConverter fields and fields declared
+ * as a Gson JsonElement type, and for several values, such as the arguments of a workflow method.
+ * Enabling it on a domain with open workflows makes the untyped JSON they recorded unreadable for
+ * non-final types.
  */
 public final class JacksonDataConverter implements DataConverter {
 
@@ -258,14 +262,14 @@ public final class JacksonDataConverter implements DataConverter {
    *
    * <p>{@code mapperInterceptor} receives a new ObjectMapper that already has the configuration
    * this converter needs: its handling of exceptions, java.time and Optional values, Sets, Gson's
-   * annotations, and classes without a usable constructor. The interceptor configures that mapper,
-   * for example by registering modules or changing features, and returns it, or a {@link
-   * ObjectMapper#copy() copy} of it. Modules it registers take precedence over the configuration of
-   * this converter. It must not return another ObjectMapper, such as one shared by the application:
-   * apply the settings of that mapper to the given one instead, for example by registering the same
-   * modules. To keep the support of Gson's {@code SerializedName} when setting an annotation
-   * introspector, add yours as the secondary one, which then applies where the existing ones find
-   * nothing: {@code
+   * annotations and types, and classes without a usable constructor. The interceptor configures
+   * that mapper, for example by registering modules or changing features, and returns it, or a
+   * {@link ObjectMapper#copy() copy} of it. Modules it registers take precedence over the
+   * configuration of this converter. It must not return another ObjectMapper, such as one shared by
+   * the application: apply the settings of that mapper to the given one instead, for example by
+   * registering the same modules. To keep the support of Gson's {@code SerializedName} when setting
+   * an annotation introspector, add yours as the secondary one, which then applies where the
+   * existing ones find nothing: {@code
    * mapper.setAnnotationIntrospector(AnnotationIntrospectorPair.pair(mapper.getSerializationConfig().getAnnotationIntrospector(),
    * yours))}.
    *
@@ -952,6 +956,8 @@ public final class JacksonDataConverter implements DataConverter {
       // behave differently on replay. JsonDataConverter uses LinkedHashSet as well.
       addAbstractTypeMapping(Set.class, LinkedHashSet.class);
       addAbstractTypeMapping(AbstractSet.class, LinkedHashSet.class);
+      // Gson's tree types are written as the JSON they represent.
+      addSerializer(JsonElement.class, new GsonJsonElementSerialization.Serializer());
     }
 
     /** The same id whichever way the Jackson version in use derives the id of a SimpleModule. */
@@ -965,6 +971,7 @@ public final class JacksonDataConverter implements DataConverter {
       super.setupModule(context);
       context.addValueInstantiators(new ConstructorlessValueInstantiators());
       context.addDeserializers(new ThrowableDeserializers());
+      context.addDeserializers(new GsonJsonElementSerialization.Deserializers());
       // Inserted as the primary introspector: Jackson 2.16 and later replace the enum aliases found
       // by an introspector that runs before their own.
       context.insertAnnotationIntrospector(new GsonAnnotationIntrospector());
