@@ -1,0 +1,1139 @@
+/*
+ *  Copyright 2012-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Modifications copyright (C) 2017 Uber Technologies, Inc.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"). You may not
+ *  use this file except in compliance with the License. A copy of the License is
+ *  located at
+ *
+ *  http://aws.amazon.com/apache2.0
+ *
+ *  or in the "license" file accompanying this file. This file is distributed on
+ *  an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+ *  express or implied. See the License for the specific language governing
+ *  permissions and limitations under the License.
+ */
+
+package com.uber.cadence.workflow;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+import static org.junit.Assume.assumeFalse;
+import static org.junit.Assume.assumeTrue;
+
+import com.google.common.base.Splitter;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.annotations.SerializedName;
+import com.uber.cadence.EventType;
+import com.uber.cadence.HistoryEvent;
+import com.uber.cadence.TimeoutType;
+import com.uber.cadence.WorkflowExecution;
+import com.uber.cadence.activity.ActivityOptions;
+import com.uber.cadence.activity.LocalActivityOptions;
+import com.uber.cadence.client.WorkflowClient;
+import com.uber.cadence.client.WorkflowClientOptions;
+import com.uber.cadence.client.WorkflowFailureException;
+import com.uber.cadence.client.WorkflowStub;
+import com.uber.cadence.common.RetryOptions;
+import com.uber.cadence.common.WorkflowExecutionHistory;
+import com.uber.cadence.converter.DataConverter;
+import com.uber.cadence.converter.DataConverterException;
+import com.uber.cadence.converter.JacksonDataConverter;
+import com.uber.cadence.converter.JsonDataConverter;
+import com.uber.cadence.internal.common.WorkflowExecutionUtils;
+import com.uber.cadence.testUtils.TestEnvironment;
+import com.uber.cadence.testing.SimulatedTimeoutException;
+import com.uber.cadence.testing.TestEnvironmentOptions;
+import com.uber.cadence.testing.TestWorkflowEnvironment;
+import com.uber.cadence.worker.Worker;
+import com.uber.cadence.worker.WorkerFactoryOptions;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.ExternalResource;
+import org.junit.rules.RuleChain;
+import org.junit.rules.Timeout;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
+
+/**
+ * Runs workflows end to end in the in-memory test service with the data converter used by both the
+ * client and the workers. Besides user payloads this covers the payloads the client itself encodes
+ * with the configured converter: markers of local activities, getVersion and mutableSideEffect, the
+ * RetryOptions of Workflow.retry, failures and empty results of void workflows.
+ */
+@RunWith(Parameterized.class)
+public class DataConverterIntegrationTest {
+
+  private static final String TASK_LIST = "DataConverterIntegrationTest";
+  private static final int WORKFLOW_TIMEOUT_SECONDS = 3600;
+  private static final long RESULT_TIMEOUT_SECONDS = 30;
+
+  @Parameters(name = "{0}")
+  public static Collection<Object[]> data() {
+    List<Object[]> rows = new ArrayList<>();
+    if (isConverterEnabled("gson")) {
+      DataConverter gson = JsonDataConverter.getInstance();
+      rows.add(new Object[] {"gson sticky OFF", gson, true});
+      rows.add(new Object[] {"gson sticky ON", gson, false});
+      // A custom converter that wraps JsonDataConverter.
+      rows.add(new Object[] {"prefixing-gson sticky OFF", new PrefixingDataConverter(gson), true});
+    }
+    if (isConverterEnabled("jackson")) {
+      DataConverter jackson = JacksonDataConverter.getInstance();
+      rows.add(new Object[] {"jackson sticky OFF", jackson, true});
+      rows.add(new Object[] {"jackson sticky ON", jackson, false});
+    }
+    return rows;
+  }
+
+  /**
+   * Whether the tests run with the named converter ("gson" or "jackson"). The system property
+   * cadence.test.converters restricts them to a comma separated list of converters.
+   */
+  private static boolean isConverterEnabled(String name) {
+    String converters = System.getProperty("cadence.test.converters", "gson,jackson");
+    return Splitter.on(',').trimResults().splitToList(converters).contains(name);
+  }
+
+  private final DataConverter converter;
+  private final boolean disableStickyExecution;
+  private final List<TestWorkflowEnvironment> environments = new ArrayList<>();
+
+  // Closes the environments outside of the timeout, so also after a test that timed out.
+  @Rule
+  public final RuleChain rules =
+      RuleChain.outerRule(
+              new ExternalResource() {
+                @Override
+                protected void after() {
+                  for (TestWorkflowEnvironment environment : environments) {
+                    environment.close();
+                  }
+                }
+              })
+          .around(Timeout.seconds(60));
+
+  private TestActivitiesImpl activities;
+  private TestWorkflowEnvironment testEnvironment;
+  private WorkflowClient client;
+
+  public DataConverterIntegrationTest(
+      String ignored, DataConverter converter, boolean disableStickyExecution) {
+    this.converter = converter;
+    this.disableStickyExecution = disableStickyExecution;
+  }
+
+  @Before
+  public void setUp() {
+    assumeFalse("Uses the in-memory test service", TestEnvironment.isUseDockerService());
+    activities = new TestActivitiesImpl();
+    testEnvironment = startEnvironment(converter, activities);
+    client = testEnvironment.newWorkflowClient();
+  }
+
+  @Test
+  public void testLocalActivityReturningPojo() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    assertEquals("42 USD", runScenario(Scenario.LOCAL_ACTIVITY));
+  }
+
+  @Test
+  public void testLocalActivityRetriedAfterTimer() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    ScenarioWorkflow workflow = startScenario(Scenario.LOCAL_ACTIVITY_RETRY);
+    assertEquals("once-ok", resultOf(workflow, String.class));
+    assertEquals(2, activities.failOnceCalls.get());
+    // The backoff is longer than the decision task timeout, so the retry waits for a timer.
+    List<HistoryEvent> history =
+        historyOf(testEnvironment, WorkflowStub.fromTyped(workflow).getExecution());
+    assertTrue(WorkflowExecutionUtils.containsEvent(history, EventType.TimerStarted));
+  }
+
+  @Test
+  public void testGetVersionAcrossDecisionTasks() throws Exception {
+    assertEquals("1/1 tag(done)", runScenario(Scenario.VERSION));
+  }
+
+  @Test
+  public void testMutableSideEffectAcrossDecisionTasks() throws Exception {
+    assertEquals("7/7", runScenario(Scenario.MUTABLE_SIDE_EFFECT));
+  }
+
+  @Test
+  public void testWorkflowRetry() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    assertEquals("twice-ok", runScenario(Scenario.RETRY));
+    assertEquals(3, activities.failTwiceCalls.get());
+  }
+
+  @Test
+  public void testWorkflowRetryDoesNotRetryException() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    assertEquals(codeExceptionDescription("rejectWithCode"), runScenario(Scenario.DO_NOT_RETRY));
+    assertEquals(1, activities.rejectCalls.get());
+  }
+
+  @Test
+  public void testVoidWorkflowResult() throws Exception {
+    client.newWorkflowStub(VoidWorkflow.class).run();
+
+    VoidWorkflow executed = client.newWorkflowStub(VoidWorkflow.class);
+    assertNull(WorkflowClient.execute(executed::run).get(RESULT_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+    VoidWorkflow started = client.newWorkflowStub(VoidWorkflow.class);
+    WorkflowClient.start(started::run);
+    assertNull(resultOf(started, Void.class));
+  }
+
+  @Test
+  public void testVoidChildWorkflow() throws Exception {
+    assertEquals("completed", runScenario(Scenario.VOID_CHILD));
+  }
+
+  @Test
+  public void testReplayOwnHistory() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    replay(runMarkersScenario(testEnvironment));
+  }
+
+  @Test
+  public void testReplayHistoryRecordedWithJsonDataConverter() throws Exception {
+    assumeFalse(
+        "Accepts only payloads it wrote itself", converter instanceof PrefixingDataConverter);
+    assumeTrue(
+        "JsonDataConverter cannot convert java.time.Duration in this JVM",
+        canConvertWithGson(Duration.ofSeconds(1)));
+    TestWorkflowEnvironment recorder =
+        startEnvironment(JsonDataConverter.getInstance(), new TestActivitiesImpl());
+    replay(runMarkersScenario(recorder));
+  }
+
+  @Test
+  public void testJacksonRecordedHistoryReplaysWithGson() throws Exception {
+    assumeTrue("Records with JacksonDataConverter", converter instanceof JacksonDataConverter);
+    assumeTrue(
+        "JsonDataConverter cannot convert java.time.Duration in this JVM",
+        canConvertWithGson(Duration.ofSeconds(1)));
+    replay(JsonDataConverter.getInstance(), runMarkersScenario(testEnvironment));
+  }
+
+  @Test
+  public void testGsonAnnotatedPayloadsEndToEnd() throws Exception {
+    Map<Priority, String> labels = new LinkedHashMap<>();
+    labels.put(Priority.LOW, "ground");
+    JsonObject extras =
+        JsonParser.parseString("{\"fragile\":true,\"weight\":1.5,\"tags\":[\"glass\",7]}")
+            .getAsJsonObject();
+    Parcel parcel = new Parcel("p-1", Priority.LOW, labels, extras);
+    ParcelWorkflow workflow = client.newWorkflowStub(ParcelWorkflow.class);
+    WorkflowClient.start(workflow::run, parcel);
+    workflow.relabel(parcel.with(Priority.LOW, "freight"));
+
+    Parcel expected = parcel.with(Priority.HIGH, "express").with(Priority.LOW, "freight");
+    assertEquals(expected, resultOf(workflow, Parcel.class));
+    assertEquals(expected, workflow.current());
+
+    // Written under the names given by the annotations, and with the Gson tree as the JSON that it
+    // holds, as JsonDataConverter does.
+    List<HistoryEvent> history =
+        historyOf(testEnvironment, WorkflowStub.fromTyped(workflow).getExecution());
+    String input =
+        new String(
+            history.get(0).getWorkflowExecutionStartedEventAttributes().getInput(),
+            StandardCharsets.UTF_8);
+    assertTrue(input, input.contains("\"parcel_id\":\"p-1\""));
+    assertTrue(input, input.contains("\"prio\":\"low\""));
+    assertTrue(input, input.contains("\"labels_by_priority\":{"));
+    assertTrue(
+        input,
+        input.contains("\"extras\":{\"fragile\":true,\"weight\":1.5,\"tags\":[\"glass\",7]}"));
+    List<String> activityResults = new ArrayList<>();
+    for (HistoryEvent event : history) {
+      if (event.getEventType() == EventType.ActivityTaskCompleted) {
+        activityResults.add(
+            new String(
+                event.getActivityTaskCompletedEventAttributes().getResult(),
+                StandardCharsets.UTF_8));
+      }
+    }
+    assertEquals(1, activityResults.size());
+    assertTrue(activityResults.get(0), activityResults.get(0).contains("\"prio\":\"high\""));
+  }
+
+  @Test
+  public void testActivityFailureCause() throws Exception {
+    assertEquals(
+        codeExceptionDescription("rejectWithCode"), runScenario(Scenario.CATCH_ACTIVITY_FAILURE));
+  }
+
+  @Test
+  public void testSimulatedActivityTimeout() throws Exception {
+    assertEquals("HEARTBEAT heartbeat details", runScenario(Scenario.ACTIVITY_TIMEOUT));
+  }
+
+  @Test
+  public void testChildWorkflowFailureCause() throws Exception {
+    assertEquals(codeExceptionDescription("run"), runScenario(Scenario.CHILD_FAILURE));
+  }
+
+  @Test
+  public void testWorkflowFailureCause() throws Exception {
+    FailingWorkflow failing = client.newWorkflowStub(FailingWorkflow.class);
+    WorkflowClient.start(failing::run);
+    try {
+      resultOf(failing, String.class);
+      fail("WorkflowFailureException expected");
+    } catch (WorkflowFailureException e) {
+      assertCodeException(e.getCause());
+    }
+  }
+
+  @Test
+  public void testWorkflowFailureCausedByActivityFailure() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    ScenarioWorkflow workflow = startScenario(Scenario.THROW_ACTIVITY_FAILURE);
+    try {
+      resultOf(workflow, String.class);
+      fail("WorkflowFailureException expected");
+    } catch (WorkflowFailureException e) {
+      assertEquals(ActivityFailureException.class, e.getCause().getClass());
+      ActivityFailureException failure = (ActivityFailureException) e.getCause();
+      assertEquals("TestActivities::rejectWithCode", failure.getActivityType().getName());
+      assertCodeException(failure.getCause());
+    }
+  }
+
+  @Test
+  public void testSetKeepsIterationOrder() throws Exception {
+    // Item has no hashCode, so a HashSet would iterate in a different order in every decision
+    // task, and activity results would be attributed to the wrong items on replay.
+    Set<Item> items = new LinkedHashSet<>();
+    List<String> expected = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+      String name = "item-" + i;
+      items.add(new Item(name));
+      expected.add(name + " -> tag(" + name + ")");
+    }
+    ItemsWorkflow workflow = client.newWorkflowStub(ItemsWorkflow.class);
+    WorkflowClient.start(workflow::run, items);
+    assertEquals(String.join(", ", expected), resultOf(workflow, String.class));
+  }
+
+  @Test
+  public void testPojoWithoutNoArgConstructor() throws Exception {
+    MoneyWorkflow workflow = client.newWorkflowStub(MoneyWorkflow.class);
+    WorkflowClient.start(workflow::run, new Money(21, "USD"));
+    workflow.add(new Money(8, "USD"));
+    assertEquals(new Money(50, "USD"), resultOf(workflow, Money.class));
+    assertEquals(new Money(50, "USD"), workflow.current());
+  }
+
+  @Test
+  public void testOptionalFields() throws Exception {
+    assumeGsonCanConvert(Optional.of("value"));
+    OptionalValues values =
+        new OptionalValues(
+            Optional.of("text"),
+            Optional.empty(),
+            OptionalInt.of(1),
+            OptionalLong.empty(),
+            OptionalDouble.of(0.5));
+    OptionalWorkflow workflow = client.newWorkflowStub(OptionalWorkflow.class);
+    WorkflowClient.start(workflow::run, values);
+    assertEquals(values.next().next(), resultOf(workflow, OptionalValues.class));
+  }
+
+  @Test
+  public void testExceptionTypedField() throws Exception {
+    OutcomeWorkflow workflow = client.newWorkflowStub(OutcomeWorkflow.class);
+    WorkflowClient.start(workflow::run);
+    Outcome outcome = resultOf(workflow, Outcome.class);
+    assertEquals("rejected", outcome.status);
+    assertCodeException(outcome.error);
+  }
+
+  private TestWorkflowEnvironment newEnvironment(DataConverter dataConverter) {
+    TestWorkflowEnvironment environment =
+        TestWorkflowEnvironment.newInstance(
+            new TestEnvironmentOptions.Builder()
+                .setDataConverter(dataConverter)
+                .setWorkflowClientOptions(
+                    WorkflowClientOptions.newBuilder().setDataConverter(dataConverter).build())
+                .setWorkerFactoryOptions(
+                    WorkerFactoryOptions.newBuilder()
+                        .setDisableStickyExecution(disableStickyExecution)
+                        .build())
+                .build());
+    environments.add(environment);
+    return environment;
+  }
+
+  private TestWorkflowEnvironment startEnvironment(
+      DataConverter dataConverter, TestActivitiesImpl activitiesImpl) {
+    TestWorkflowEnvironment environment = newEnvironment(dataConverter);
+    Worker worker = environment.newWorker(TASK_LIST);
+    worker.registerWorkflowImplementationTypes(
+        ScenarioWorkflowImpl.class,
+        VoidWorkflowImpl.class,
+        FailingWorkflowImpl.class,
+        ItemsWorkflowImpl.class,
+        MoneyWorkflowImpl.class,
+        OptionalWorkflowImpl.class,
+        OutcomeWorkflowImpl.class,
+        ParcelWorkflowImpl.class);
+    worker.registerActivitiesImplementations(activitiesImpl);
+    environment.start();
+    return environment;
+  }
+
+  private ScenarioWorkflow startScenario(Scenario scenario) {
+    ScenarioWorkflow workflow = client.newWorkflowStub(ScenarioWorkflow.class);
+    WorkflowClient.start(workflow::run, scenario);
+    return workflow;
+  }
+
+  private String runScenario(Scenario scenario) throws TimeoutException {
+    return resultOf(startScenario(scenario), String.class);
+  }
+
+  private static <R> R resultOf(Object workflow, Class<R> resultClass) throws TimeoutException {
+    return WorkflowStub.fromTyped(workflow)
+        .getResult(RESULT_TIMEOUT_SECONDS, TimeUnit.SECONDS, resultClass);
+  }
+
+  /** Runs a workflow that records every kind of marker and returns its history. */
+  private static WorkflowExecutionHistory runMarkersScenario(TestWorkflowEnvironment environment)
+      throws TimeoutException {
+    ScenarioWorkflow workflow =
+        environment.newWorkflowClient().newWorkflowStub(ScenarioWorkflow.class);
+    WorkflowClient.start(workflow::run, Scenario.MARKERS);
+    assertEquals("1 once-ok 7/7 twice-ok", resultOf(workflow, String.class));
+    return new WorkflowExecutionHistory(
+        historyOf(environment, WorkflowStub.fromTyped(workflow).getExecution()));
+  }
+
+  private void replay(WorkflowExecutionHistory history) throws Exception {
+    replay(converter, history);
+  }
+
+  private void replay(DataConverter dataConverter, WorkflowExecutionHistory history)
+      throws Exception {
+    Worker replayer = newEnvironment(dataConverter).newWorker(TASK_LIST);
+    replayer.registerWorkflowImplementationTypes(ScenarioWorkflowImpl.class);
+    replayer.replayWorkflowExecution(history);
+  }
+
+  private static List<HistoryEvent> historyOf(
+      TestWorkflowEnvironment environment, WorkflowExecution execution) {
+    List<HistoryEvent> events = new ArrayList<>();
+    Iterator<HistoryEvent> iterator =
+        WorkflowExecutionUtils.getHistory(
+            environment.getWorkflowService(), environment.getDomain(), execution);
+    while (iterator.hasNext()) {
+      events.add(iterator.next());
+    }
+    return events;
+  }
+
+  /**
+   * JsonDataConverter reflects on the fields of JDK classes such as java.time.Duration and
+   * java.util.Optional, which fails when java.base is not open to it (JDK 16+). Skips Gson based
+   * rows in that case.
+   */
+  private void assumeGsonCanConvert(Object value) {
+    if (!(converter instanceof JacksonDataConverter)) {
+      assumeTrue(
+          "JsonDataConverter cannot convert " + value.getClass().getName() + " in this JVM",
+          canConvertWithGson(value));
+    }
+  }
+
+  private static boolean canConvertWithGson(Object value) {
+    DataConverter gson = JsonDataConverter.getInstance();
+    try {
+      gson.fromData(gson.toData(value), value.getClass(), value.getClass());
+      return true;
+    } catch (DataConverterException e) {
+      return false;
+    }
+  }
+
+  private static void assertCodeException(Throwable failure) {
+    assertEquals(CodeException.class, failure.getClass());
+    assertEquals("rejected (code 42)", failure.getMessage());
+    assertEquals(42, ((CodeException) failure).getCode());
+  }
+
+  private static String codeExceptionDescription(String thrownBy) {
+    return CodeException.class.getName() + ": rejected (code 42), code 42, at " + thrownBy;
+  }
+
+  static TestActivities newActivityStub() {
+    return Workflow.newActivityStub(
+        TestActivities.class,
+        new ActivityOptions.Builder().setScheduleToCloseTimeout(Duration.ofSeconds(30)).build());
+  }
+
+  /** Describes a failure received by workflow code, so that tests can assert on it. */
+  static String describe(Throwable failure) {
+    StringBuilder result =
+        new StringBuilder(failure.getClass().getName()).append(": ").append(failure.getMessage());
+    if (failure instanceof CodeException) {
+      result.append(", code ").append(((CodeException) failure).getCode());
+    }
+    StackTraceElement[] stackTrace = failure.getStackTrace();
+    if (stackTrace.length > 0) {
+      result.append(", at ").append(stackTrace[0].getMethodName());
+    }
+    return result.toString();
+  }
+
+  /** Has no (String) or no-arg constructor, and its constructor decorates the message. */
+  public static class CodeException extends RuntimeException {
+    private final int code;
+
+    public CodeException(String message, int code) {
+      super(message + " (code " + code + ")");
+      this.code = code;
+    }
+
+    public int getCode() {
+      return code;
+    }
+  }
+
+  /** Has no hashCode, so its hash code differs in every decoded instance. */
+  public static final class Item {
+    private final String name;
+
+    public Item(String name) {
+      this.name = name;
+    }
+
+    private Item() {
+      this(null);
+    }
+
+    public String getName() {
+      return name;
+    }
+  }
+
+  /** Has only an all-args constructor. */
+  public static final class Money {
+    private final long amount;
+    private final String currency;
+
+    public Money(long amount, String currency) {
+      this.amount = amount;
+      this.currency = currency;
+    }
+
+    Money plus(Money other) {
+      return new Money(amount + other.amount, currency);
+    }
+
+    Money times(long factor) {
+      return new Money(amount * factor, currency);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof Money)) {
+        return false;
+      }
+      Money money = (Money) o;
+      return amount == money.amount && Objects.equals(currency, money.currency);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(amount, currency);
+    }
+
+    @Override
+    public String toString() {
+      return amount + " " + currency;
+    }
+  }
+
+  public static final class OptionalValues {
+    private final Optional<String> text;
+    private final Optional<String> missing;
+    private final OptionalInt count;
+    private final OptionalLong total;
+    private final OptionalDouble ratio;
+
+    public OptionalValues(
+        Optional<String> text,
+        Optional<String> missing,
+        OptionalInt count,
+        OptionalLong total,
+        OptionalDouble ratio) {
+      this.text = text;
+      this.missing = missing;
+      this.count = count;
+      this.total = total;
+      this.ratio = ratio;
+    }
+
+    OptionalValues next() {
+      return new OptionalValues(
+          text.map(value -> value + "!"),
+          missing.map(value -> value + "!"),
+          count.isPresent() ? OptionalInt.of(count.getAsInt() + 1) : count,
+          total.isPresent() ? OptionalLong.of(total.getAsLong() + 1) : total,
+          ratio.isPresent() ? OptionalDouble.of(ratio.getAsDouble() * 2) : ratio);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof OptionalValues)) {
+        return false;
+      }
+      OptionalValues that = (OptionalValues) o;
+      return text.equals(that.text)
+          && missing.equals(that.missing)
+          && count.equals(that.count)
+          && total.equals(that.total)
+          && ratio.equals(that.ratio);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(text, missing, count, total, ratio);
+    }
+
+    @Override
+    public String toString() {
+      return Arrays.asList(text, missing, count, total, ratio).toString();
+    }
+  }
+
+  public static final class Outcome {
+    private final String status;
+    private final CodeException error;
+
+    public Outcome(String status, CodeException error) {
+      this.status = status;
+      this.error = error;
+    }
+
+    private Outcome() {
+      this(null, null);
+    }
+  }
+
+  /** Renamed with Gson's annotations, which JacksonDataConverter applies too. */
+  public enum Priority {
+    @SerializedName("low")
+    LOW,
+    @SerializedName(
+      value = "high",
+      alternate = {"urgent"}
+    )
+    HIGH
+  }
+
+  /** Its fields are renamed with Gson's annotations, and it has a field of a Gson tree type. */
+  public static final class Parcel {
+    @SerializedName("parcel_id")
+    private final String id;
+
+    @SerializedName(
+      value = "prio",
+      alternate = {"priority"}
+    )
+    private final Priority priority;
+
+    @SerializedName("labels_by_priority")
+    private final Map<Priority, String> labels;
+
+    private final JsonObject extras;
+
+    public Parcel(String id, Priority priority, Map<Priority, String> labels, JsonObject extras) {
+      this.id = id;
+      this.priority = priority;
+      this.labels = labels;
+      this.extras = extras;
+    }
+
+    /** A copy with the priority and its label. */
+    Parcel with(Priority priority, String label) {
+      Map<Priority, String> newLabels = new LinkedHashMap<>(labels);
+      newLabels.put(priority, label);
+      return new Parcel(id, priority, newLabels, extras);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof Parcel)) {
+        return false;
+      }
+      Parcel parcel = (Parcel) o;
+      return Objects.equals(id, parcel.id)
+          && priority == parcel.priority
+          && Objects.equals(labels, parcel.labels)
+          && Objects.equals(extras, parcel.extras);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(id, priority, labels, extras);
+    }
+
+    @Override
+    public String toString() {
+      return id + " " + priority + " " + labels + " " + extras;
+    }
+  }
+
+  public interface TestActivities {
+    Money doubleAmount(Money amount);
+
+    String failOnce();
+
+    String failTwice();
+
+    String rejectWithCode();
+
+    String timeOutWithDetails();
+
+    String tag(Item item);
+
+    OptionalValues next(OptionalValues values);
+
+    Outcome outcome();
+
+    Parcel prioritize(Parcel parcel);
+  }
+
+  public static class TestActivitiesImpl implements TestActivities {
+    final AtomicInteger failOnceCalls = new AtomicInteger();
+    final AtomicInteger failTwiceCalls = new AtomicInteger();
+    final AtomicInteger rejectCalls = new AtomicInteger();
+
+    @Override
+    public Money doubleAmount(Money amount) {
+      return amount.times(2);
+    }
+
+    @Override
+    public String failOnce() {
+      if (failOnceCalls.incrementAndGet() < 2) {
+        throw new IllegalStateException("fails once");
+      }
+      return "once-ok";
+    }
+
+    @Override
+    public String failTwice() {
+      if (failTwiceCalls.incrementAndGet() < 3) {
+        throw new IllegalStateException("fails twice");
+      }
+      return "twice-ok";
+    }
+
+    @Override
+    public String rejectWithCode() {
+      rejectCalls.incrementAndGet();
+      throw new CodeException("rejected", 42);
+    }
+
+    @Override
+    public String timeOutWithDetails() {
+      throw new SimulatedTimeoutException(TimeoutType.HEARTBEAT, "heartbeat details");
+    }
+
+    @Override
+    public String tag(Item item) {
+      return "tag(" + item.getName() + ")";
+    }
+
+    @Override
+    public OptionalValues next(OptionalValues values) {
+      return values.next();
+    }
+
+    @Override
+    public Outcome outcome() {
+      return new Outcome("rejected", new CodeException("rejected", 42));
+    }
+
+    @Override
+    public Parcel prioritize(Parcel parcel) {
+      return parcel.with(Priority.HIGH, "express");
+    }
+  }
+
+  public enum Scenario {
+    LOCAL_ACTIVITY,
+    LOCAL_ACTIVITY_RETRY,
+    VERSION,
+    MUTABLE_SIDE_EFFECT,
+    RETRY,
+    DO_NOT_RETRY,
+    CATCH_ACTIVITY_FAILURE,
+    THROW_ACTIVITY_FAILURE,
+    ACTIVITY_TIMEOUT,
+    VOID_CHILD,
+    CHILD_FAILURE,
+    MARKERS
+  }
+
+  public interface ScenarioWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    String run(Scenario scenario);
+  }
+
+  public static class ScenarioWorkflowImpl implements ScenarioWorkflow {
+
+    private final TestActivities activities = newActivityStub();
+
+    @Override
+    public String run(Scenario scenario) {
+      switch (scenario) {
+        case LOCAL_ACTIVITY:
+          return localActivities(null).doubleAmount(new Money(21, "USD")).toString();
+        case LOCAL_ACTIVITY_RETRY:
+          return localActivities(retryOptions(Duration.ofSeconds(30))).failOnce();
+        case VERSION:
+          return version();
+        case MUTABLE_SIDE_EFFECT:
+          return mutableSideEffect();
+        case RETRY:
+          return Workflow.retry(retryOptions(Duration.ofSeconds(1)), activities::failTwice);
+        case DO_NOT_RETRY:
+          return doNotRetry();
+        case CATCH_ACTIVITY_FAILURE:
+          try {
+            return activities.rejectWithCode();
+          } catch (ActivityFailureException e) {
+            return describe(e.getCause());
+          }
+        case THROW_ACTIVITY_FAILURE:
+          return activities.rejectWithCode();
+        case ACTIVITY_TIMEOUT:
+          try {
+            return activities.timeOutWithDetails();
+          } catch (ActivityTimeoutException e) {
+            return e.getTimeoutType() + " " + e.getDetails(String.class);
+          }
+        case VOID_CHILD:
+          return voidChild();
+        case CHILD_FAILURE:
+          try {
+            return Workflow.newChildWorkflowStub(FailingWorkflow.class).run();
+          } catch (ChildWorkflowFailureException e) {
+            return describe(e.getCause());
+          }
+        case MARKERS:
+          return markers();
+      }
+      throw new IllegalArgumentException("Unknown scenario " + scenario);
+    }
+
+    private String version() {
+      int first = Workflow.getVersion("change", Workflow.DEFAULT_VERSION, 1);
+      Workflow.sleep(Duration.ofMinutes(1));
+      int second = Workflow.getVersion("change", Workflow.DEFAULT_VERSION, 1);
+      return first + "/" + second + " " + activities.tag(new Item("done"));
+    }
+
+    private static String voidChild() {
+      Workflow.newChildWorkflowStub(VoidWorkflow.class).run();
+      Void result = Workflow.newUntypedChildWorkflowStub("VoidWorkflow::run").execute(Void.class);
+      return result == null ? "completed" : "unexpected result";
+    }
+
+    private static String mutableSideEffect() {
+      Integer first =
+          Workflow.mutableSideEffect("value", Integer.class, (stored, value) -> false, () -> 7);
+      Workflow.sleep(Duration.ofMinutes(1));
+      // Returns the value recorded by the first call, as the new value is not an update.
+      Integer second =
+          Workflow.mutableSideEffect("value", Integer.class, (stored, value) -> false, () -> 8);
+      return first + "/" + second;
+    }
+
+    private String doNotRetry() {
+      RetryOptions options =
+          new RetryOptions.Builder()
+              .setInitialInterval(Duration.ofSeconds(1))
+              .setMaximumAttempts(3)
+              .setDoNotRetry(CodeException.class)
+              .build();
+      try {
+        return Workflow.retry(options, activities::rejectWithCode);
+      } catch (ActivityFailureException e) {
+        return describe(e.getCause());
+      }
+    }
+
+    private String markers() {
+      int version = Workflow.getVersion("change", Workflow.DEFAULT_VERSION, 1);
+      String local = localActivities(retryOptions(Duration.ofSeconds(30))).failOnce();
+      String sideEffect = mutableSideEffect();
+      String retried = Workflow.retry(retryOptions(Duration.ofSeconds(1)), activities::failTwice);
+      return version + " " + local + " " + sideEffect + " " + retried;
+    }
+
+    private static TestActivities localActivities(RetryOptions retryOptions) {
+      return Workflow.newLocalActivityStub(
+          TestActivities.class,
+          new LocalActivityOptions.Builder()
+              .setScheduleToCloseTimeout(Duration.ofMinutes(5))
+              .setRetryOptions(retryOptions)
+              .build());
+    }
+
+    private static RetryOptions retryOptions(Duration initialInterval) {
+      return new RetryOptions.Builder()
+          .setInitialInterval(initialInterval)
+          .setMaximumAttempts(3)
+          .build();
+    }
+  }
+
+  public interface VoidWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    void run();
+  }
+
+  public static class VoidWorkflowImpl implements VoidWorkflow {
+    @Override
+    public void run() {}
+  }
+
+  public interface FailingWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    String run();
+  }
+
+  public static class FailingWorkflowImpl implements FailingWorkflow {
+    @Override
+    public String run() {
+      throw new CodeException("rejected", 42);
+    }
+  }
+
+  public interface ItemsWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    String run(Set<Item> items);
+  }
+
+  public static class ItemsWorkflowImpl implements ItemsWorkflow {
+    @Override
+    public String run(Set<Item> items) {
+      TestActivities activities = newActivityStub();
+      List<String> results = new ArrayList<>();
+      // One activity per decision task: without sticky execution each one decodes the input again.
+      for (Item item : items) {
+        results.add(item.getName() + " -> " + activities.tag(item));
+      }
+      return String.join(", ", results);
+    }
+  }
+
+  public interface MoneyWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    Money run(Money initial);
+
+    @SignalMethod
+    void add(Money amount);
+
+    @QueryMethod
+    Money current();
+  }
+
+  public static class MoneyWorkflowImpl implements MoneyWorkflow {
+    private Money current;
+    private Money added;
+
+    @Override
+    public Money run(Money initial) {
+      current = newActivityStub().doubleAmount(initial);
+      Workflow.await(() -> added != null);
+      current = current.plus(added);
+      return current;
+    }
+
+    @Override
+    public void add(Money amount) {
+      added = amount;
+    }
+
+    @Override
+    public Money current() {
+      return current;
+    }
+  }
+
+  public interface OptionalWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    OptionalValues run(OptionalValues values);
+  }
+
+  public static class OptionalWorkflowImpl implements OptionalWorkflow {
+    @Override
+    public OptionalValues run(OptionalValues values) {
+      return newActivityStub().next(values.next());
+    }
+  }
+
+  public interface OutcomeWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    Outcome run();
+  }
+
+  public static class OutcomeWorkflowImpl implements OutcomeWorkflow {
+    @Override
+    public Outcome run() {
+      return newActivityStub().outcome();
+    }
+  }
+
+  public interface ParcelWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    Parcel run(Parcel parcel);
+
+    @SignalMethod
+    void relabel(Parcel parcel);
+
+    @QueryMethod
+    Parcel current();
+  }
+
+  public static class ParcelWorkflowImpl implements ParcelWorkflow {
+    private Parcel current;
+    private Parcel relabeled;
+
+    @Override
+    public Parcel run(Parcel parcel) {
+      current = newActivityStub().prioritize(parcel);
+      Workflow.await(() -> relabeled != null);
+      current = current.with(relabeled.priority, relabeled.labels.get(relabeled.priority));
+      return current;
+    }
+
+    @Override
+    public void relabel(Parcel parcel) {
+      relabeled = parcel;
+    }
+
+    @Override
+    public Parcel current() {
+      return current;
+    }
+  }
+
+  /**
+   * A custom converter that prefixes the payloads of another converter and rejects payloads without
+   * the prefix, so that a payload the client decodes without having encoded it with the configured
+   * converter fails.
+   */
+  static final class PrefixingDataConverter implements DataConverter {
+    private static final byte[] PREFIX = {'C', 'D', 'C', '1'};
+
+    private final DataConverter delegate;
+
+    PrefixingDataConverter(DataConverter delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public byte[] toData(Object... values) throws DataConverterException {
+      byte[] data = delegate.toData(values);
+      if (data == null || data.length == 0) {
+        return data;
+      }
+      byte[] result = Arrays.copyOf(PREFIX, PREFIX.length + data.length);
+      System.arraycopy(data, 0, result, PREFIX.length, data.length);
+      return result;
+    }
+
+    @Override
+    public <T> T fromData(byte[] content, Class<T> valueClass, Type valueType)
+        throws DataConverterException {
+      return delegate.fromData(strip(content, valueType), valueClass, valueType);
+    }
+
+    @Override
+    public Object[] fromDataArray(byte[] content, Type... valueTypes)
+        throws DataConverterException {
+      return delegate.fromDataArray(strip(content, valueTypes), valueTypes);
+    }
+
+    private static byte[] strip(byte[] content, Type... valueTypes) {
+      // Empty payloads, such as the result of a void workflow, are written by the client itself.
+      if (content == null || content.length == 0) {
+        return content;
+      }
+      if (content.length < PREFIX.length
+          || !Arrays.equals(PREFIX, Arrays.copyOf(content, PREFIX.length))) {
+        throw new DataConverterException(
+            "Payload not written by PrefixingDataConverter", content, valueTypes);
+      }
+      return Arrays.copyOfRange(content, PREFIX.length, content.length);
+    }
+  }
+}

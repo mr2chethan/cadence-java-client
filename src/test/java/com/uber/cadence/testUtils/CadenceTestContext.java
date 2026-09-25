@@ -236,6 +236,9 @@ public class CadenceTestContext {
     TestEnvironmentOptions testOptions =
         new TestEnvironmentOptions.Builder()
             .setWorkflowClientOptions(clientOptions)
+            // Workers use the converter of the client options, but newWorkflowClient() uses this
+            // one. Without it the client of a test would always use JsonDataConverter.
+            .setDataConverter(clientOptions.getDataConverter())
             .setInterceptorFactory(tracer)
             .setWorkerFactoryOptions(workerFactoryOptions)
             .build();

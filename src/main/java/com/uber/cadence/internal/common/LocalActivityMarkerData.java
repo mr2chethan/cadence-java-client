@@ -122,6 +122,11 @@ public final class LocalActivityMarkerData {
       this.backoff = backoff;
       this.isCancelled = isCancelled;
     }
+
+    // Used by data converters that need a no-arg constructor to deserialize the header.
+    private LocalActivityMarkerHeader() {
+      this(null, null, 0, null, 0, null, false);
+    }
   }
 
   private final LocalActivityMarkerHeader headers;
