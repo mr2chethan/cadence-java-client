@@ -48,6 +48,9 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
+import java.util.AbstractSet;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -76,6 +79,16 @@ import org.slf4j.LoggerFactory;
  *         .setDataConverter(JacksonDataConverter.getInstance())
  *         .build());
  * }</pre>
+ *
+ * <p>Behavior to be aware of:
+ *
+ * <ul>
+ *   <li>An empty or whitespace-only payload is decoded as null (the first argument null and the
+ *       remaining ones their default value), like {@link JsonDataConverter}.
+ *   <li>An abstract {@link Set} is decoded as an insertion-ordered {@link LinkedHashSet}.
+ *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
+ *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
+ * </ul>
  */
 public final class JacksonDataConverter implements DataConverter {
 
@@ -165,6 +178,11 @@ public final class JacksonDataConverter implements DataConverter {
     // {"class":..,"stackTrace":"..","cause":{..}} format, matching Gson's behavior.
     cadenceModule.addSerializer(Throwable.class, new ThrowableSerializer(mapper));
     cadenceModule.setDeserializerModifier(new ThrowableDeserializerModifier());
+    // HashSet iteration order depends on hash codes, which for enums and other classes without
+    // a hashCode override differ between processes. Workflow code iterating a Set would then
+    // behave differently on replay. JsonDataConverter uses LinkedHashSet as well.
+    cadenceModule.addAbstractTypeMapping(Set.class, LinkedHashSet.class);
+    cadenceModule.addAbstractTypeMapping(AbstractSet.class, LinkedHashSet.class);
     mapper.registerModule(cadenceModule);
 
     return mapper;
@@ -199,7 +217,8 @@ public final class JacksonDataConverter implements DataConverter {
   @Override
   public <T> T fromData(byte[] content, Class<T> valueClass, Type valueType)
       throws DataConverterException {
-    if (content == null) {
+    // An empty payload, for example the result of a void workflow, is null as in JsonDataConverter.
+    if (content == null || isBlank(content)) {
       return null;
     }
     try {
@@ -225,6 +244,15 @@ public final class JacksonDataConverter implements DataConverter {
         throw new DataConverterException(
             "Content doesn't match expected arguments", content, valueTypes);
       }
+      if (isBlank(content)) {
+        // Like JsonDataConverter, which reads an empty payload as a single JSON null: the first
+        // argument is null and the remaining ones get their default values.
+        Object[] result = new Object[valueTypes.length];
+        for (int i = 1; i < valueTypes.length; i++) {
+          result[i] = defaultValueOf(valueTypes[i]);
+        }
+        return result;
+      }
       if (valueTypes.length == 1) {
         JavaType javaType = objectMapper.getTypeFactory().constructType(valueTypes[0]);
         Object result;
@@ -248,12 +276,7 @@ public final class JacksonDataConverter implements DataConverter {
       Object[] result = new Object[valueTypes.length];
       for (int i = 0; i < valueTypes.length; i++) {
         if (i >= array.size()) { // Missing arguments => add defaults
-          Type t = valueTypes[i];
-          if (t instanceof Class) {
-            result[i] = Defaults.defaultValue((Class<?>) t);
-          } else {
-            result[i] = null;
-          }
+          result[i] = defaultValueOf(valueTypes[i]);
         } else {
           JavaType javaType = objectMapper.getTypeFactory().constructType(valueTypes[i]);
           if (Throwable.class.isAssignableFrom(javaType.getRawClass())) {
@@ -271,6 +294,20 @@ public final class JacksonDataConverter implements DataConverter {
     } catch (Exception e) {
       throw new DataConverterException(content, valueTypes, e);
     }
+  }
+
+  /** True for a payload made only of JSON whitespace, including an empty one. */
+  private static boolean isBlank(byte[] content) {
+    for (byte b : content) {
+      if (b != ' ' && b != '\t' && b != '\n' && b != '\r') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static Object defaultValueOf(Type type) {
+    return type instanceof Class ? Defaults.defaultValue((Class<?>) type) : null;
   }
 
   // ---------- Throwable serialization (matches Gson CustomThrowableTypeAdapter behavior)

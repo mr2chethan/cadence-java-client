@@ -262,6 +262,12 @@ public final class RetryOptions {
     this.doNotRetry = doNotRetry != null ? Collections.unmodifiableList(doNotRetry) : null;
   }
 
+  // Used by data converters that need a no-arg constructor to deserialize the options, which
+  // Workflow.retry records through the configured data converter.
+  private RetryOptions() {
+    this(null, 0, null, 0, null, null);
+  }
+
   public Duration getInitialInterval() {
     return initialInterval;
   }
