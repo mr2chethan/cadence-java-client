@@ -24,6 +24,7 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.Version;
+import com.fasterxml.jackson.databind.AnnotationIntrospector;
 import com.fasterxml.jackson.databind.BeanDescription;
 import com.fasterxml.jackson.databind.BeanProperty;
 import com.fasterxml.jackson.databind.DeserializationConfig;
@@ -54,6 +55,7 @@ import com.fasterxml.jackson.datatype.jsr310.deser.DurationDeserializer;
 import com.google.common.base.Defaults;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.gson.annotations.SerializedName;
 import com.uber.cadence.client.ApplicationFailureException;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -132,6 +134,11 @@ import org.slf4j.LoggerFactory;
  *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
  *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
  * </ul>
+ *
+ * <p>Gson annotations: like {@link JsonDataConverter}, it applies Gson's {@code SerializedName}
+ * (the name and alternate names of fields, including fields of exceptions, and of enum constants).
+ * A non-empty name of a Jackson {@code JsonProperty} takes precedence over the name of {@code
+ * SerializedName}, which is then still read. Gson's {@code JsonAdapter} is not supported.
  *
  * <p>Migrating from {@link JsonDataConverter}:
  *
@@ -250,12 +257,17 @@ public final class JacksonDataConverter implements DataConverter {
    * Constructs an instance with a customized {@link ObjectMapper}.
    *
    * <p>{@code mapperInterceptor} receives a new ObjectMapper that already has the configuration
-   * this converter needs: its handling of exceptions, java.time and Optional values, Sets and
-   * classes without a usable constructor. The interceptor configures that mapper, for example by
-   * registering modules or changing features, and returns it, or a {@link ObjectMapper#copy() copy}
-   * of it. Modules it registers take precedence over the configuration of this converter. It must
-   * not return another ObjectMapper, such as one shared by the application: apply the settings of
-   * that mapper to the given one instead, for example by registering the same modules.
+   * this converter needs: its handling of exceptions, java.time and Optional values, Sets, Gson's
+   * annotations, and classes without a usable constructor. The interceptor configures that mapper,
+   * for example by registering modules or changing features, and returns it, or a {@link
+   * ObjectMapper#copy() copy} of it. Modules it registers take precedence over the configuration of
+   * this converter. It must not return another ObjectMapper, such as one shared by the application:
+   * apply the settings of that mapper to the given one instead, for example by registering the same
+   * modules. To keep the support of Gson's {@code SerializedName} when setting an annotation
+   * introspector, add yours as the secondary one, which then applies where the existing ones find
+   * nothing: {@code
+   * mapper.setAnnotationIntrospector(AnnotationIntrospectorPair.pair(mapper.getSerializationConfig().getAnnotationIntrospector(),
+   * yours))}.
    *
    * <p>The converter keeps its own copy of the returned mapper. Changes made to the mapper after
    * this constructor returns have no effect on the converter.
@@ -287,6 +299,23 @@ public final class JacksonDataConverter implements DataConverter {
     }
     // Changes made later through a reference kept by the interceptor do not affect this converter.
     this.objectMapper = configured.copy();
+    if (!hasGsonAnnotationIntrospector(objectMapper)) {
+      log.warn(
+          "The ObjectMapper of this JacksonDataConverter no longer has the annotation introspector"
+              + " that applies Gson's @SerializedName, so fields and enum constants renamed with it"
+              + " are written and read under their Java names. To keep it, add your introspector"
+              + " as the secondary one: AnnotationIntrospectorPair.pair(existing, yours).");
+    }
+  }
+
+  private static boolean hasGsonAnnotationIntrospector(ObjectMapper mapper) {
+    for (AnnotationIntrospector introspector :
+        mapper.getDeserializationConfig().getAnnotationIntrospector().allIntrospectors()) {
+      if (introspector instanceof GsonAnnotationIntrospector) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -559,7 +588,7 @@ public final class JacksonDataConverter implements DataConverter {
         try {
           field.setAccessible(true);
           Object value = field.get(throwable);
-          node.set(field.getName(), mapper.valueToTree(value));
+          node.set(jsonNameOf(field), mapper.valueToTree(value));
         } catch (Exception e) {
           allFieldsWritten = false;
           log.warn("Failed to serialize field: " + field.getName(), e);
@@ -590,7 +619,32 @@ public final class JacksonDataConverter implements DataConverter {
     return !Modifier.isStatic(modifiers)
         && !Modifier.isTransient(modifiers)
         && !field.isSynthetic()
-        && !RESERVED_THROWABLE_KEYS.contains(field.getName());
+        && !RESERVED_THROWABLE_KEYS.contains(jsonNameOf(field));
+  }
+
+  /**
+   * The key of a field in the JSON of an exception. Like in JsonDataConverter, whose
+   * CustomThrowableTypeAdapter writes the fields with Gson, it is the name given by Gson's {@code
+   * SerializedName}.
+   */
+  private static String jsonNameOf(Field field) {
+    SerializedName name = field.getAnnotation(SerializedName.class);
+    return name == null ? field.getName() : name.value();
+  }
+
+  /** The JSON of a field of an exception, under its name or one of its alternate names. */
+  private static JsonNode fieldNode(ObjectNode object, Field field) {
+    JsonNode node = object.get(jsonNameOf(field));
+    SerializedName name = field.getAnnotation(SerializedName.class);
+    if (node == null && name != null) {
+      for (String alternate : name.alternate()) {
+        node = object.get(alternate);
+        if (node != null) {
+          break;
+        }
+      }
+    }
+    return node;
   }
 
   /**
@@ -786,7 +840,7 @@ public final class JacksonDataConverter implements DataConverter {
         }
         try {
           field.setAccessible(true);
-          field.set(result, readField(field, object.get(field.getName()), field.get(result), ctxt));
+          field.set(result, readField(field, fieldNode(object, field), field.get(result), ctxt));
         } catch (IllegalAccessException | RuntimeException e) {
           // For example a field of a JDK exception whose package is not open to this code.
           log.debug("Failed to restore field {} of {}", field.getName(), clazz.getName(), e);
@@ -911,6 +965,9 @@ public final class JacksonDataConverter implements DataConverter {
       super.setupModule(context);
       context.addValueInstantiators(new ConstructorlessValueInstantiators());
       context.addDeserializers(new ThrowableDeserializers());
+      // Inserted as the primary introspector: Jackson 2.16 and later replace the enum aliases found
+      // by an introspector that runs before their own.
+      context.insertAnnotationIntrospector(new GsonAnnotationIntrospector());
       // Reads what JsonDataConverter wrote, and writes the Durations of the client's own data so
       // that JsonDataConverter can read them.
       context.addBeanDeserializerModifier(new GsonCompatibility.ReadModifier());

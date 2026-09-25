@@ -11,6 +11,7 @@
 - Add WorkflowReplayer methods that replay with a given DataConverter
 - JacksonDataConverter writes the Durations of the client's own records (local activity markers, retry options) in the form JsonDataConverter reads, and reads Durations in both forms
 - JacksonDataConverter reads what JsonDataConverter wrote, and adds gsonCompatibleNumbersModule() to decode untyped numbers as Double like Gson. Switching back is not supported for open workflows; see its javadoc
+- JacksonDataConverter applies Gson's @SerializedName to fields and enum constants, like JsonDataConverter
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)
