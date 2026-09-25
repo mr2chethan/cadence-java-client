@@ -9,6 +9,7 @@
 - Fix JacksonDataConverter failing on classes without a no-arg constructor, and support Optional (adds the jackson-datatype-jdk8 dependency)
 - JacksonDataConverter rejects a mapper interceptor that returns another ObjectMapper, keeps its own copy of the mapper, writes and reads the client's own records with the default configuration whatever the customization, and supports default typing
 - Add WorkflowReplayer methods that replay with a given DataConverter
+- JacksonDataConverter writes the Durations of the client's own records (local activity markers, retry options) in the form JsonDataConverter reads, and reads Durations in both forms
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)

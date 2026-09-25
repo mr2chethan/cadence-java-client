@@ -22,8 +22,10 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.Version;
 import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.BeanProperty;
 import com.fasterxml.jackson.databind.DeserializationConfig;
 import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -36,6 +38,7 @@ import com.fasterxml.jackson.databind.Module;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.deser.ContextualDeserializer;
 import com.fasterxml.jackson.databind.deser.Deserializers;
 import com.fasterxml.jackson.databind.deser.ValueInstantiator;
 import com.fasterxml.jackson.databind.deser.ValueInstantiators;
@@ -47,6 +50,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.fasterxml.jackson.datatype.jsr310.deser.DurationDeserializer;
 import com.google.common.base.Defaults;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -59,6 +63,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -122,6 +127,27 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link Optional} values are written as the contained value, or null when empty.
  *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
  *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
+ * </ul>
+ *
+ * <p>Migrating from {@link JsonDataConverter}:
+ *
+ * <ul>
+ *   <li>Configure the same converter on all clients and workers of a domain.
+ *   <li>Workflows that are open when a deployment switches converters are replayed with the new
+ *       converter. Switch only for new domains or task lists, after the open workflows complete, or
+ *       for new code paths behind {@code Workflow.getVersion}, unless you verified the replay of
+ *       your open histories with this converter.
+ *   <li>{@link JsonDataConverter} reads the data that the client records for itself with this
+ *       converter, such as the headers of markers and the retry options of {@code Workflow.retry},
+ *       on JDK 15 and earlier or with {@code --add-opens java.base/java.time}. It does not read
+ *       this converter's java.time values, Optionals, byte arrays and Durations of your payloads,
+ *       nor of the fields of exceptions (for example the backoff of an ActivityFailureException,
+ *       the details of an ActivityTimeoutException and the workflow type of a
+ *       WorkflowFailureException), so switching back to {@link JsonDataConverter} is not supported
+ *       for open workflows whose payloads contain them.
+ *   <li>Memos and search attributes are always written and read with {@link JsonDataConverter}.
+ *   <li>Changing the configuration of the ObjectMapper, for example the naming of properties, on a
+ *       deployment with open workflows is like switching converters.
  * </ul>
  *
  * <p>Default typing ({@code ObjectMapper.activateDefaultTyping}) is supported, also for the types
@@ -223,7 +249,9 @@ public final class JacksonDataConverter implements DataConverter {
    * <p>The customization applies to the values of workflows, activities, signals and queries and to
    * the fields of exceptions. It does not apply to the data the client records for itself, such as
    * the headers of version and local activity markers and the retry options of {@code
-   * Workflow.retry}, which are always written and read with the default configuration.
+   * Workflow.retry}, which are always written and read with the default configuration. The
+   * Durations of these retry options are always written as {@code {"seconds":..,"nanos":..}}, also
+   * inside other values.
    *
    * @param mapperInterceptor configures the given ObjectMapper and returns it, or a copy of it
    * @throws IllegalArgumentException if {@code mapperInterceptor} returns null or another
@@ -287,7 +315,7 @@ public final class JacksonDataConverter implements DataConverter {
     mapper.setVisibility(PropertyAccessor.IS_GETTER, JsonAutoDetect.Visibility.NONE);
     mapper.setVisibility(PropertyAccessor.SETTER, JsonAutoDetect.Visibility.NONE);
 
-    // Register custom module for Throwable, DataConverter, and Class handling
+    // Registered after JavaTimeModule, so that its Duration deserializer takes precedence.
     mapper.registerModule(new CadenceModule(mapper));
 
     return mapper;
@@ -837,6 +865,7 @@ public final class JacksonDataConverter implements DataConverter {
       // Serialize every Throwable (top-level, nested, suppressed) with the compact
       // {"class":..,"stackTrace":"..","cause":{..}} format, matching Gson's behavior.
       addSerializer(Throwable.class, new ThrowableSerializer(mapper));
+      addDeserializer(Duration.class, new LenientDurationDeserializer());
       // HashSet iteration order depends on hash codes, which for enums and other classes without
       // a hashCode override differ between processes. Workflow code iterating a Set would then
       // behave differently on replay. JsonDataConverter uses LinkedHashSet as well.
@@ -855,6 +884,10 @@ public final class JacksonDataConverter implements DataConverter {
       super.setupModule(context);
       context.addValueInstantiators(new ConstructorlessValueInstantiators());
       context.addDeserializers(new ThrowableDeserializers());
+      // Reads what JsonDataConverter wrote, and writes the Durations of the client's own data so
+      // that JsonDataConverter can read them.
+      context.addBeanDeserializerModifier(new GsonCompatibility.InternalPayloadReadModifier());
+      context.addBeanSerializerModifier(new GsonCompatibility.InternalPayloadWriteModifier());
     }
   }
 
@@ -1041,6 +1074,52 @@ public final class JacksonDataConverter implements DataConverter {
     @Override
     public boolean isCachable() {
       return true;
+    }
+  }
+
+  /**
+   * Reads a Duration in the formats of Jackson and also in the {"seconds":..,"nanos":..} format of
+   * JsonDataConverter, which is found in histories recorded with it, for example in local activity
+   * markers and in the RetryOptions of Workflow.retry.
+   */
+  static final class LenientDurationDeserializer extends StdDeserializer<Duration>
+      implements ContextualDeserializer {
+
+    private final JsonDeserializer<?> delegate;
+
+    LenientDurationDeserializer() {
+      this(DurationDeserializer.INSTANCE);
+    }
+
+    private LenientDurationDeserializer(JsonDeserializer<?> delegate) {
+      super(Duration.class);
+      this.delegate = delegate;
+    }
+
+    @Override
+    public JsonDeserializer<?> createContextual(DeserializationContext ctxt, BeanProperty property)
+        throws JsonMappingException {
+      return new LenientDurationDeserializer(
+          DurationDeserializer.INSTANCE.createContextual(ctxt, property));
+    }
+
+    @Override
+    public Duration deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+      if (!p.hasToken(JsonToken.START_OBJECT)) {
+        return (Duration) delegate.deserialize(p, ctxt);
+      }
+      JsonNode node = ctxt.readTree(p);
+      JsonNode seconds = node.path("seconds");
+      JsonNode nanos = node.path("nanos");
+      if (!isLong(seconds) || !(nanos.isMissingNode() || isLong(nanos))) {
+        return ctxt.reportInputMismatch(
+            Duration.class, "Expected {\"seconds\":..,\"nanos\":..} for Duration, found %s", node);
+      }
+      return Duration.ofSeconds(seconds.longValue(), nanos.longValue());
+    }
+
+    private static boolean isLong(JsonNode node) {
+      return node.isIntegralNumber() && node.canConvertToLong();
     }
   }
 

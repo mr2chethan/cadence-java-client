@@ -23,10 +23,13 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeNoException;
+import static org.junit.Assume.assumeTrue;
 
 import com.google.common.base.Splitter;
 import com.uber.cadence.ActivityType;
+import com.uber.cadence.Header;
 import com.uber.cadence.MarkerRecordedEventAttributes;
 import com.uber.cadence.RespondActivityTaskCanceledRequest;
 import com.uber.cadence.RespondActivityTaskFailedRequest;
@@ -45,12 +48,35 @@ import org.junit.runners.Parameterized;
 
 /**
  * The header of a local activity marker is encoded with the data converter of the worker, so every
- * converter has to be able to decode it.
+ * converter has to be able to decode it, including headers recorded by JsonDataConverter.
  */
 @RunWith(Parameterized.class)
 public class LocalActivityMarkerDataConverterTest {
 
+  private static final String HEADER_KEY = "LocalActivityHeader";
+
   private static final ActivityType ACTIVITY_TYPE = new ActivityType().setName("Activity::run");
+
+  /** Header of a failed local activity recorded by JsonDataConverter, which escapes '='. */
+  private static final String GSON_FAILURE_HEADER =
+      "{\"activityId\":\"la-1\",\"activityType\":\"ActivityType(name\\u003dActivity::run)\","
+          + "\"errReason\":\"java.lang.IllegalStateException\",\"replayTimeMillis\":1234,"
+          + "\"attempt\":2,\"backoff\":{\"seconds\":30,\"nanos\":0},\"isCancelled\":false}";
+
+  /**
+   * The header of {@link #GSON_FAILURE_HEADER} as JacksonDataConverter writes it, whatever the
+   * configuration of its ObjectMapper: it only does not escape '='.
+   */
+  private static final String JACKSON_FAILURE_HEADER =
+      "{\"activityId\":\"la-1\",\"activityType\":\"ActivityType(name=Activity::run)\","
+          + "\"errReason\":\"java.lang.IllegalStateException\",\"replayTimeMillis\":1234,"
+          + "\"attempt\":2,\"backoff\":{\"seconds\":30,\"nanos\":0},\"isCancelled\":false}";
+
+  /** Header of a completed local activity recorded by JsonDataConverter. */
+  private static final String GSON_SUCCESS_HEADER =
+      "{\"activityId\":\"la-2\",\"activityType\":\"ActivityType(name\\u003dActivity::run)\","
+          + "\"errReason\":null,\"replayTimeMillis\":1234,\"attempt\":0,\"backoff\":null,"
+          + "\"isCancelled\":false}";
 
   private final DataConverter converter;
 
@@ -157,12 +183,131 @@ public class LocalActivityMarkerDataConverterTest {
     assertArrayEquals(details, decoded.getResult());
   }
 
+  @Test
+  public void testGsonHeaderFormatIsUnchanged() {
+    assumeTrue("Checks the format of JsonDataConverter", converter instanceof JsonDataConverter);
+    assumeDurationIsSupported();
+    LocalActivityMarkerData marker =
+        new LocalActivityMarkerData.Builder()
+            .setActivityId("la-1")
+            .setActivityType(ACTIVITY_TYPE)
+            .setReplayTimeMillis(1234L)
+            .setTaskFailedRequest(
+                new RespondActivityTaskFailedRequest().setReason("java.lang.IllegalStateException"))
+            .setAttempt(2)
+            .setBackoff(Duration.ofSeconds(30))
+            .build();
+
+    byte[] header = marker.getHeader(converter).getFields().get(HEADER_KEY);
+
+    assertEquals(GSON_FAILURE_HEADER, new String(header, StandardCharsets.UTF_8));
+  }
+
+  @Test
+  public void testJacksonHeaderFormat() {
+    assumeFalse(
+        "Checks the format of JacksonDataConverter", converter instanceof JsonDataConverter);
+
+    byte[] header =
+        failedMarker(Duration.ofSeconds(30)).getHeader(converter).getFields().get(HEADER_KEY);
+
+    assertEquals(JACKSON_FAILURE_HEADER, new String(header, StandardCharsets.UTF_8));
+  }
+
+  /** JsonDataConverter reads the header written by every converter, for example on a rollback. */
+  @Test
+  public void testGsonReadsHeaderWrittenByThisConverter() {
+    DataConverter gson = JsonDataConverter.getInstance();
+    assumeDurationIsSupported(gson);
+    LocalActivityMarkerData marker = failedMarker(Duration.ofMillis(1500));
+    MarkerRecordedEventAttributes attributes =
+        new MarkerRecordedEventAttributes().setHeader(marker.getHeader(converter));
+
+    LocalActivityMarkerData decoded = LocalActivityMarkerData.fromEventAttributes(attributes, gson);
+
+    assertEquals("la-1", decoded.getActivityId());
+    assertEquals(ACTIVITY_TYPE.toString(), decoded.getActivityType());
+    assertEquals(1234L, decoded.getReplayTimeMillis());
+    assertEquals("java.lang.IllegalStateException", decoded.getErrReason());
+    assertEquals(2, decoded.getAttempt());
+    assertEquals(Duration.ofMillis(1500), decoded.getBackoff());
+    assertFalse(decoded.getIsCancelled());
+  }
+
+  @Test
+  public void testDecodesFailedActivityHeaderRecordedByGson() {
+    assumeDurationIsSupported();
+    byte[] details = "{}".getBytes(StandardCharsets.UTF_8);
+
+    LocalActivityMarkerData decoded =
+        LocalActivityMarkerData.fromEventAttributes(
+            markerAttributes(GSON_FAILURE_HEADER, details), converter);
+
+    assertEquals("la-1", decoded.getActivityId());
+    assertEquals(ACTIVITY_TYPE.toString(), decoded.getActivityType());
+    assertEquals(1234L, decoded.getReplayTimeMillis());
+    assertEquals("java.lang.IllegalStateException", decoded.getErrReason());
+    assertArrayEquals(details, decoded.getErrJson());
+    assertEquals(2, decoded.getAttempt());
+    assertEquals(Duration.ofSeconds(30), decoded.getBackoff());
+    assertFalse(decoded.getIsCancelled());
+  }
+
+  @Test
+  public void testDecodesBackoffWithNanosRecordedByGson() {
+    assumeDurationIsSupported();
+    String header =
+        GSON_FAILURE_HEADER.replace(
+            "{\"seconds\":30,\"nanos\":0}", "{\"seconds\":1,\"nanos\":500000000}");
+
+    LocalActivityMarkerData decoded =
+        LocalActivityMarkerData.fromEventAttributes(markerAttributes(header, null), converter);
+
+    assertEquals(Duration.ofMillis(1500), decoded.getBackoff());
+  }
+
+  @Test
+  public void testDecodesCompletedActivityHeaderRecordedByGson() {
+    assumeDurationIsSupported();
+    byte[] result = converter.toData("done");
+
+    LocalActivityMarkerData decoded =
+        LocalActivityMarkerData.fromEventAttributes(
+            markerAttributes(GSON_SUCCESS_HEADER, result), converter);
+
+    assertEquals("la-2", decoded.getActivityId());
+    assertNull(decoded.getErrReason());
+    assertNull(decoded.getErrJson());
+    assertEquals(0, decoded.getAttempt());
+    assertNull(decoded.getBackoff());
+    assertFalse(decoded.getIsCancelled());
+    assertArrayEquals(result, decoded.getResult());
+  }
+
+  private static LocalActivityMarkerData failedMarker(Duration backoff) {
+    return new LocalActivityMarkerData.Builder()
+        .setActivityId("la-1")
+        .setActivityType(ACTIVITY_TYPE)
+        .setReplayTimeMillis(1234L)
+        .setTaskFailedRequest(
+            new RespondActivityTaskFailedRequest().setReason("java.lang.IllegalStateException"))
+        .setAttempt(2)
+        .setBackoff(backoff)
+        .build();
+  }
+
   private LocalActivityMarkerData roundTrip(LocalActivityMarkerData marker) {
     MarkerRecordedEventAttributes attributes =
         new MarkerRecordedEventAttributes()
             .setHeader(marker.getHeader(converter))
             .setDetails(marker.getResult());
     return LocalActivityMarkerData.fromEventAttributes(attributes, converter);
+  }
+
+  private static MarkerRecordedEventAttributes markerAttributes(String header, byte[] details) {
+    Header markerHeader = new Header();
+    markerHeader.getFields().put(HEADER_KEY, header.getBytes(StandardCharsets.UTF_8));
+    return new MarkerRecordedEventAttributes().setHeader(markerHeader).setDetails(details);
   }
 
   /**
