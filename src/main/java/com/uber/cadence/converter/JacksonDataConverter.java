@@ -28,12 +28,14 @@ import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.SerializerProvider;
-import com.fasterxml.jackson.databind.deser.BeanDeserializerModifier;
+import com.fasterxml.jackson.databind.deser.Deserializers;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -46,10 +48,18 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.util.AbstractSet;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Matcher;
@@ -83,6 +93,12 @@ import org.slf4j.LoggerFactory;
  * <p>Behavior to be aware of:
  *
  * <ul>
+ *   <li>Exceptions are restored as their exact class with their exact message, stack trace, cause,
+ *       suppressed exceptions and fields. Like {@link JsonDataConverter}, the no-arg constructor of
+ *       the exception class is used when it has one. Otherwise, as with Java serialization, no
+ *       constructor of the exception class runs. A JDK exception whose fields are not accessible to
+ *       this code (JDK 16 and later without --add-opens for its package) is created with its
+ *       (String) constructor, or else as an ApplicationFailureException, with its message.
  *   <li>An empty or whitespace-only payload is decoded as null (the first argument null and the
  *       remaining ones their default value), like {@link JsonDataConverter}.
  *   <li>An abstract {@link Set} is decoded as an insertion-ordered {@link LinkedHashSet}.
@@ -114,6 +130,34 @@ public final class JacksonDataConverter implements DataConverter {
       ImmutableSet.of(
           "com.uber.cadence.internal.worker.POJOActivityImplementationFactory$POJOActivityImplementation.execute",
           "com.uber.cadence.internal.sync.POJODecisionTaskHandler$POJOWorkflowImplementation.execute");
+
+  /** Keys of the JSON of an exception that fields of exception classes cannot use. */
+  private static final ImmutableSet<String> RESERVED_THROWABLE_KEYS =
+      ImmutableSet.of("detailMessage", "stackTrace", "cause", "suppressedExceptions", "class");
+
+  /**
+   * Whether an exception class can be restored as itself, which needs all the fields of its JSON to
+   * be settable. That is not the case for JDK exceptions with fields in a package that is not open
+   * to this code (JDK 16 and later without --add-opens for the package).
+   */
+  private static final ClassValue<Boolean> RESTORABLE =
+      new ClassValue<Boolean>() {
+        @Override
+        protected Boolean computeValue(Class<?> type) {
+          for (Class<?> c = type; c != Throwable.class; c = c.getSuperclass()) {
+            for (Field field : c.getDeclaredFields()) {
+              if (isThrowableJsonField(field)) {
+                try {
+                  field.setAccessible(true);
+                } catch (RuntimeException e) {
+                  return false;
+                }
+              }
+            }
+          }
+          return true;
+        }
+      };
 
   private final ObjectMapper objectMapper;
 
@@ -169,21 +213,7 @@ public final class JacksonDataConverter implements DataConverter {
     mapper.setVisibility(PropertyAccessor.SETTER, JsonAutoDetect.Visibility.NONE);
 
     // Register custom module for Throwable, DataConverter, and Class handling
-    SimpleModule cadenceModule = new SimpleModule("CadenceModule");
-    cadenceModule.addSerializer(DataConverter.class, new DataConverterSerializer());
-    cadenceModule.addDeserializer(DataConverter.class, new DataConverterDeserializer());
-    cadenceModule.addSerializer(Class.class, new ClassSerializer());
-    cadenceModule.addDeserializer(Class.class, new ClassDeserializer());
-    // Serialize every Throwable (top-level, nested, suppressed) with the compact
-    // {"class":..,"stackTrace":"..","cause":{..}} format, matching Gson's behavior.
-    cadenceModule.addSerializer(Throwable.class, new ThrowableSerializer(mapper));
-    cadenceModule.setDeserializerModifier(new ThrowableDeserializerModifier());
-    // HashSet iteration order depends on hash codes, which for enums and other classes without
-    // a hashCode override differ between processes. Workflow code iterating a Set would then
-    // behave differently on replay. JsonDataConverter uses LinkedHashSet as well.
-    cadenceModule.addAbstractTypeMapping(Set.class, LinkedHashSet.class);
-    cadenceModule.addAbstractTypeMapping(AbstractSet.class, LinkedHashSet.class);
-    mapper.registerModule(cadenceModule);
+    mapper.registerModule(new CadenceModule(mapper));
 
     return mapper;
   }
@@ -223,12 +253,7 @@ public final class JacksonDataConverter implements DataConverter {
     }
     try {
       JavaType javaType = objectMapper.getTypeFactory().constructType(valueType);
-      if (Throwable.class.isAssignableFrom(valueClass)) {
-        return deserializeThrowable(content, javaType);
-      }
       return objectMapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
-    } catch (DataConverterException e) {
-      throw e;
     } catch (Exception e) {
       throw new DataConverterException(content, new Type[] {valueType}, e);
     }
@@ -255,12 +280,8 @@ public final class JacksonDataConverter implements DataConverter {
       }
       if (valueTypes.length == 1) {
         JavaType javaType = objectMapper.getTypeFactory().constructType(valueTypes[0]);
-        Object result;
-        if (Throwable.class.isAssignableFrom(javaType.getRawClass())) {
-          result = deserializeThrowable(content, javaType);
-        } else {
-          result = objectMapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
-        }
+        Object result =
+            objectMapper.readValue(new String(content, StandardCharsets.UTF_8), javaType);
         return new Object[] {result};
       }
 
@@ -279,13 +300,7 @@ public final class JacksonDataConverter implements DataConverter {
           result[i] = defaultValueOf(valueTypes[i]);
         } else {
           JavaType javaType = objectMapper.getTypeFactory().constructType(valueTypes[i]);
-          if (Throwable.class.isAssignableFrom(javaType.getRawClass())) {
-            byte[] elementBytes =
-                objectMapper.writeValueAsString(array.get(i)).getBytes(StandardCharsets.UTF_8);
-            result[i] = deserializeThrowable(elementBytes, javaType);
-          } else {
-            result[i] = objectMapper.treeToValue(array.get(i), javaType);
-          }
+          result[i] = objectMapper.treeToValue(array.get(i), javaType);
         }
       }
       return result;
@@ -387,16 +402,17 @@ public final class JacksonDataConverter implements DataConverter {
    */
   private static ObjectNode buildThrowableFieldsNode(Throwable throwable, ObjectMapper mapper) {
     ObjectNode node = mapper.createObjectNode();
-    // Always include the message
-    node.put("detailMessage", throwable.getMessage());
+    // Always include the message. Set below, once it is known whether all fields were written.
+    node.putNull("detailMessage");
 
-    // Serialize subclass-specific fields via reflection
+    // Serialize subclass-specific fields via reflection. A field hidden by a field of the same
+    // name in a subclass is skipped.
+    Set<String> names = new HashSet<>();
+    boolean allFieldsWritten = true;
     Class<?> clazz = throwable.getClass();
     while (clazz != null && clazz != Throwable.class && clazz != Object.class) {
       for (Field field : clazz.getDeclaredFields()) {
-        if (java.lang.reflect.Modifier.isStatic(field.getModifiers())
-            || java.lang.reflect.Modifier.isTransient(field.getModifiers())
-            || field.isSynthetic()) {
+        if (!isThrowableJsonField(field) || !names.add(field.getName())) {
           continue;
         }
         try {
@@ -404,11 +420,13 @@ public final class JacksonDataConverter implements DataConverter {
           Object value = field.get(throwable);
           node.set(field.getName(), mapper.valueToTree(value));
         } catch (Exception e) {
+          allFieldsWritten = false;
           log.warn("Failed to serialize field: " + field.getName(), e);
         }
       }
       clazz = clazz.getSuperclass();
     }
+    node.put("detailMessage", messageOf(throwable, allFieldsWritten, !names.isEmpty()));
 
     // Suppressed exceptions
     Throwable[] suppressed = throwable.getSuppressed();
@@ -425,146 +443,272 @@ public final class JacksonDataConverter implements DataConverter {
     return node;
   }
 
-  @SuppressWarnings("unchecked")
-  private <T> T deserializeThrowable(byte[] content, JavaType javaType) throws IOException {
-    JsonNode rootNode = objectMapper.readTree(new String(content, StandardCharsets.UTF_8));
-    if (!rootNode.isObject()) {
-      throw new DataConverterException(
-          content, new Type[] {javaType}, new IOException("Expected JSON object for Throwable"));
-    }
-    return (T) throwableFromJsonNode((ObjectNode) rootNode, objectMapper);
+  /** Whether the field is written to, and read from, the JSON of an exception. */
+  private static boolean isThrowableJsonField(Field field) {
+    int modifiers = field.getModifiers();
+    return !Modifier.isStatic(modifiers)
+        && !Modifier.isTransient(modifiers)
+        && !field.isSynthetic()
+        && !RESERVED_THROWABLE_KEYS.contains(field.getName());
   }
 
-  static Throwable throwableFromJsonNode(ObjectNode object, ObjectMapper mapper)
-      throws IOException {
-    JsonNode classElement = object.get("class");
-    if (classElement == null) {
-      throw new IOException("Missing 'class' field in Throwable JSON");
+  /**
+   * Returns the message to write. When all fields of the exception are written, that is the message
+   * it was created with, as {@link Throwable#getMessage()} can be overridden to decorate it or to
+   * compute it from these fields, and the exception is restored as its exact class with them.
+   * Otherwise it is getMessage(), which is also the case for a null message and no fields, as the
+   * message can be computed (like the helpful message of a NullPointerException) or come from
+   * fields that could not be written, for example of a JDK exception whose package is not open to
+   * this code.
+   */
+  private static String messageOf(
+      Throwable throwable, boolean allFieldsWritten, boolean hasFields) {
+    Field field = ThrowableFields.DETAIL_MESSAGE;
+    if (allFieldsWritten && field != null) {
+      try {
+        String message = (String) field.get(throwable);
+        if (message != null || hasFields) {
+          return message;
+        }
+      } catch (IllegalAccessException | RuntimeException e) {
+        // Use getMessage() below.
+      }
     }
+    return throwable.getMessage();
+  }
 
-    String className = classElement.asText();
+  /**
+   * Fields of Throwable, resolved on first use so that nothing is accessed reflectively unless
+   * needed. Null when {@code java.lang} is not open to this code.
+   */
+  private static final class ThrowableFields {
+    static final Field DETAIL_MESSAGE = accessibleField("detailMessage");
+    static final Field CAUSE = accessibleField("cause");
+
+    private static Field accessibleField(String name) {
+      try {
+        Field field = Throwable.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
+      } catch (NoSuchFieldException | RuntimeException e) {
+        return null;
+      }
+    }
+  }
+
+  // ---------- Throwable deserialization ----------
+
+  /**
+   * Restores a Throwable from its compact form as an instance of the exact class named in "class"
+   * (see {@link #newThrowable}). Fields declared by the exception classes are then set from the
+   * JSON, and the stack trace, cause and suppressed exceptions through the public Throwable API.
+   */
+  private static Throwable throwableFromJsonNode(ObjectNode object, DeserializationContext ctxt)
+      throws IOException {
+    JsonNode classNode = object.get("class");
+    if (classNode == null || classNode.isNull()) {
+      throw JsonMappingException.from(ctxt, "Missing 'class' field in Throwable JSON");
+    }
+    String className = classNode.asText();
     Class<?> classType;
     try {
-      classType = Class.forName(className);
-    } catch (ClassNotFoundException e) {
+      classType = Class.forName(className, false, JacksonDataConverter.class.getClassLoader());
+    } catch (ClassNotFoundException | LinkageError e) {
       classType = ApplicationFailureException.class;
     }
     if (!Throwable.class.isAssignableFrom(classType)) {
-      throw new IOException("Expected type that extends Throwable: " + className);
+      throw JsonMappingException.from(ctxt, "Expected type that extends Throwable: " + className);
     }
 
-    StackTraceElement[] stackTrace = parseStackTrace(object);
-
-    // Remove special fields before default deserialization
-    object.remove("class");
-    object.put("stackTrace", ""); // Clear so it doesn't interfere
-
-    // Deserialize the cause separately if present
-    JsonNode causeNode = object.remove("cause");
-
-    Throwable result;
-    try {
-      result = (Throwable) mapper.treeToValue(object, classType);
-    } catch (Exception e) {
-      // Fallback: construct manually
-      result = constructThrowable(classType, object);
+    JsonNode messageNode = object.get("detailMessage");
+    String message = messageNode == null || messageNode.isNull() ? null : messageNode.asText();
+    Throwable result = newThrowable(classType, message);
+    if (RESTORABLE.get(result.getClass())) {
+      restoreFields(result, object, ctxt);
     }
+    result.setStackTrace(parseStackTrace(object));
 
-    // Restore subclass-specific fields via reflection.
-    // Jackson's default deserialization may not populate final fields,
-    // so we do it manually from the JSON node.
-    restoreSubclassFields(result, object, mapper);
-
-    result.setStackTrace(stackTrace);
-
-    // Restore cause
+    JsonNode causeNode = object.get("cause");
     if (causeNode != null && causeNode.isObject()) {
-      try {
-        Throwable causeThrowable = throwableFromJsonNode((ObjectNode) causeNode, mapper);
-        Field causeField = Throwable.class.getDeclaredField("cause");
-        causeField.setAccessible(true);
-        causeField.set(result, causeThrowable);
-      } catch (Exception e) {
-        log.warn("Failed to restore cause in deserialized throwable.", e);
+      setCause(result, throwableFromJsonNode((ObjectNode) causeNode, ctxt));
+    } else if (result.getCause() != null) {
+      // Set by the constructor of the exception, while the original exception has no cause.
+      setCauseField(result, result);
+    }
+    JsonNode suppressedNode = object.get("suppressedExceptions");
+    if (suppressedNode != null && suppressedNode.isArray()) {
+      for (JsonNode suppressed : suppressedNode) {
+        if (suppressed.isObject()) {
+          result.addSuppressed(throwableFromJsonNode((ObjectNode) suppressed, ctxt));
+        }
       }
     }
-
     return result;
   }
 
-  private static Throwable constructThrowable(Class<?> classType, ObjectNode object) {
-    String message = null;
-    JsonNode msgNode = object.get("detailMessage");
-    if (msgNode != null) {
-      message = msgNode.asText();
+  /**
+   * Creates an instance of the exact exception class with the given message. As in
+   * JsonDataConverter, the no-arg constructor of the class is used when it has one, so that its
+   * field initializers run, and the message is then set directly. Otherwise the instance is created
+   * without running any constructor of the class, as with Java serialization, so that exceptions
+   * without a (String) or no-arg constructor keep their type.
+   *
+   * <p>A class whose fields cannot all be set (see {@link #RESTORABLE}) would lack its state that
+   * way, so it is created with its (String) constructor, as is any class on a runtime without the
+   * module jdk.unsupported. When that fails too, an ApplicationFailureException is returned.
+   */
+  private static Throwable newThrowable(Class<?> type, String message) {
+    if (RESTORABLE.get(type)) {
+      Throwable result = newThrowableWithNoArgConstructor(type, message);
+      if (result != null) {
+        return result;
+      }
+      Constructor<?> constructor = ConstructorBypass.constructorFor(type);
+      if (constructor != null) {
+        try {
+          return (Throwable) constructor.newInstance(message);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+          log.debug("Failed to instantiate {} without its constructors", type.getName(), e);
+        }
+      }
     }
-
     try {
-      Constructor<?> constructor = classType.getConstructor(String.class);
-      return (Throwable) constructor.newInstance(message);
-    } catch (Exception e1) {
-      try {
-        Constructor<?> constructor = classType.getConstructor();
-        return (Throwable) constructor.newInstance();
-      } catch (Exception e2) {
-        return new RuntimeException(message);
+      Constructor<?> stringConstructor = type.getDeclaredConstructor(String.class);
+      stringConstructor.setAccessible(true);
+      return (Throwable) stringConstructor.newInstance(message);
+    } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+      log.warn("Cannot instantiate {}, using ApplicationFailureException", type.getName(), e);
+      return new ApplicationFailureException(message);
+    }
+  }
+
+  private static Throwable newThrowableWithNoArgConstructor(Class<?> type, String message) {
+    Field detailMessage = ThrowableFields.DETAIL_MESSAGE;
+    if (detailMessage == null) {
+      // The message could not be set.
+      return null;
+    }
+    Constructor<?> constructor;
+    try {
+      constructor = type.getDeclaredConstructor();
+    } catch (NoSuchMethodException e) {
+      return null;
+    }
+    try {
+      constructor.setAccessible(true);
+      Throwable result = (Throwable) constructor.newInstance();
+      detailMessage.set(result, message);
+      return result;
+    } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+      log.debug("Failed to instantiate {} with its no-arg constructor", type.getName(), e);
+      return null;
+    }
+  }
+
+  private static void setCause(Throwable throwable, Throwable cause) {
+    try {
+      throwable.initCause(cause);
+    } catch (RuntimeException e) {
+      // The constructor of the exception set a cause already. Replace it, as JsonDataConverter
+      // does, or at least keep the cause visible.
+      if (!setCauseField(throwable, cause)) {
+        throwable.addSuppressed(cause);
+      }
+    }
+  }
+
+  /** Sets Throwable.cause directly. The throwable itself as cause means that it has none. */
+  private static boolean setCauseField(Throwable throwable, Throwable cause) {
+    Field field = ThrowableFields.CAUSE;
+    if (field == null) {
+      return false;
+    }
+    try {
+      field.set(throwable, cause);
+      return true;
+    } catch (IllegalAccessException | RuntimeException e) {
+      return false;
+    }
+  }
+
+  /** Sets the fields declared by the classes between the throwable's class and Throwable. */
+  private static void restoreFields(
+      Throwable result, ObjectNode object, DeserializationContext ctxt) {
+    Set<String> names = new HashSet<>();
+    for (Class<?> clazz = result.getClass();
+        clazz != Throwable.class;
+        clazz = clazz.getSuperclass()) {
+      for (Field field : clazz.getDeclaredFields()) {
+        // As when writing, a field hidden by a field of the same name in a subclass is skipped.
+        if (!isThrowableJsonField(field) || !names.add(field.getName())) {
+          continue;
+        }
+        try {
+          field.setAccessible(true);
+          field.set(result, readField(field, object.get(field.getName()), field.get(result), ctxt));
+        } catch (IllegalAccessException | RuntimeException e) {
+          // For example a field of a JDK exception whose package is not open to this code.
+          log.debug("Failed to restore field {} of {}", field.getName(), clazz.getName(), e);
+        }
       }
     }
   }
 
   /**
-   * Restores subclass-specific fields on a Throwable instance from the JSON object node. This
-   * handles cases where Jackson cannot populate final fields through normal deserialization.
+   * Returns the value to set to the field. A field that is missing in the JSON or cannot be read
+   * keeps the value it got when the exception was created. An Optional field is never left null:
+   * callers such as WorkflowException.getWorkflowType() use it.
    */
-  private static void restoreSubclassFields(
-      Throwable result, ObjectNode object, ObjectMapper mapper) {
-    Class<?> clazz = result.getClass();
-    while (clazz != null && clazz != Throwable.class && clazz != Object.class) {
-      for (Field field : clazz.getDeclaredFields()) {
-        if (java.lang.reflect.Modifier.isStatic(field.getModifiers())
-            || java.lang.reflect.Modifier.isTransient(field.getModifiers())
-            || field.isSynthetic()) {
-          continue;
-        }
-        JsonNode valueNode = object.get(field.getName());
-        if (valueNode != null && !valueNode.isNull()) {
-          try {
-            field.setAccessible(true);
-            JavaType fieldType = mapper.getTypeFactory().constructType(field.getGenericType());
-            Object value = mapper.treeToValue(valueNode, fieldType);
-            field.set(result, value);
-          } catch (Exception e) {
-            log.debug("Failed to restore field: " + field.getName(), e);
-          }
-        }
+  private static Object readField(
+      Field field, JsonNode valueNode, Object currentValue, DeserializationContext ctxt) {
+    Object value = currentValue;
+    if (valueNode != null && valueNode.isNull()) {
+      value = field.getType().isPrimitive() ? currentValue : null;
+    } else if (valueNode != null) {
+      try {
+        JavaType type = ctxt.getTypeFactory().constructType(field.getGenericType());
+        value = ctxt.readTreeAsValue(valueNode, type);
+      } catch (IOException | RuntimeException e) {
+        log.warn(
+            "Failed to restore field {} of {}: {}",
+            field.getName(),
+            field.getDeclaringClass().getName(),
+            e.toString());
       }
-      clazz = clazz.getSuperclass();
     }
+    return value == null ? emptyValueOf(field.getType()) : value;
+  }
+
+  private static Object emptyValueOf(Class<?> type) {
+    if (type == Optional.class) {
+      return Optional.empty();
+    } else if (type == OptionalInt.class) {
+      return OptionalInt.empty();
+    } else if (type == OptionalLong.class) {
+      return OptionalLong.empty();
+    } else if (type == OptionalDouble.class) {
+      return OptionalDouble.empty();
+    }
+    return null;
   }
 
   private static StackTraceElement[] parseStackTrace(ObjectNode object) {
     JsonNode jsonStackTrace = object.get("stackTrace");
-    if (jsonStackTrace == null) {
+    if (jsonStackTrace == null || !jsonStackTrace.isTextual()) {
       return new StackTraceElement[0];
     }
     String stackTrace = jsonStackTrace.asText();
-    if (stackTrace == null || stackTrace.isEmpty()) {
-      return new StackTraceElement[0];
-    }
-    try {
-      @SuppressWarnings("StringSplitter")
-      String[] lines = stackTrace.split("\r\n|\n");
-      StackTraceElement[] result = new StackTraceElement[lines.length];
-      for (int i = 0; i < lines.length; i++) {
-        result[i] = parseStackTraceElement(lines[i]);
+    List<StackTraceElement> result = new ArrayList<>();
+    @SuppressWarnings("StringSplitter")
+    String[] lines = stackTrace.split("\r\n|\n");
+    for (String line : lines) {
+      StackTraceElement element = parseStackTraceElement(line);
+      // setStackTrace rejects null elements, so lines that are not stack frames are skipped.
+      if (element != null) {
+        result.add(element);
       }
-      return result;
-    } catch (Exception e) {
-      if (log.isWarnEnabled()) {
-        log.warn("Failed to parse stack trace: " + stackTrace);
-      }
-      return new StackTraceElement[0];
     }
+    return result.toArray(new StackTraceElement[0]);
   }
 
   private static StackTraceElement parseStackTraceElement(String line) {
@@ -588,6 +732,35 @@ public final class JacksonDataConverter implements DataConverter {
   }
 
   // ---------- Custom Jackson serializers/deserializers ----------
+
+  /**
+   * Cadence specific (de)serialization. It is registered before the mapper interceptor runs, so
+   * modules registered by the interceptor take precedence.
+   */
+  private static final class CadenceModule extends SimpleModule {
+
+    CadenceModule(ObjectMapper mapper) {
+      super("CadenceModule");
+      addSerializer(DataConverter.class, new DataConverterSerializer());
+      addDeserializer(DataConverter.class, new DataConverterDeserializer());
+      addSerializer(Class.class, new ClassSerializer());
+      addDeserializer(Class.class, new ClassDeserializer());
+      // Serialize every Throwable (top-level, nested, suppressed) with the compact
+      // {"class":..,"stackTrace":"..","cause":{..}} format, matching Gson's behavior.
+      addSerializer(Throwable.class, new ThrowableSerializer(mapper));
+      // HashSet iteration order depends on hash codes, which for enums and other classes without
+      // a hashCode override differ between processes. Workflow code iterating a Set would then
+      // behave differently on replay. JsonDataConverter uses LinkedHashSet as well.
+      addAbstractTypeMapping(Set.class, LinkedHashSet.class);
+      addAbstractTypeMapping(AbstractSet.class, LinkedHashSet.class);
+    }
+
+    @Override
+    public void setupModule(SetupContext context) {
+      super.setupModule(context);
+      context.addDeserializers(new ThrowableDeserializers());
+    }
+  }
 
   /** Serializes DataConverter fields to a simple {"type":"JSON"} object. */
   private static class DataConverterSerializer extends JsonSerializer<DataConverter> {
@@ -673,105 +846,39 @@ public final class JacksonDataConverter implements DataConverter {
   }
 
   /**
-   * Modifier that intercepts Throwable deserialization. Keeps the default (bean) deserializer as a
-   * delegate so that subclass fields are preserved, falling back to constructor-based construction
-   * only when the delegate cannot handle the type.
+   * Routes every Throwable type to {@link ThrowableDeserializer}, so that Jackson never builds a
+   * bean deserializer for it, which would need reflective access to java.lang.Throwable.
    */
-  private static class ThrowableDeserializerModifier extends BeanDeserializerModifier {
+  private static final class ThrowableDeserializers extends Deserializers.Base {
+    private static final ThrowableDeserializer DESERIALIZER = new ThrowableDeserializer();
+
     @Override
-    public JsonDeserializer<?> modifyDeserializer(
-        DeserializationConfig config, BeanDescription beanDesc, JsonDeserializer<?> deserializer) {
-      if (Throwable.class.isAssignableFrom(beanDesc.getBeanClass())) {
-        return new ThrowableDeserializer(beanDesc.getBeanClass(), deserializer);
-      }
-      return deserializer;
+    public JsonDeserializer<?> findBeanDeserializer(
+        JavaType type, DeserializationConfig config, BeanDescription beanDesc) {
+      return Throwable.class.isAssignableFrom(type.getRawClass()) ? DESERIALIZER : null;
     }
   }
 
-  /**
-   * Custom deserializer for Throwable types. Delegates to the default bean deserializer first so
-   * that the concrete type and all declared fields are restored — matching the Gson path which uses
-   * a reflective bean adapter. Falls back to constructor-based construction only when the delegate
-   * cannot handle the type (e.g. package-private constructors).
-   */
-  private static class ThrowableDeserializer extends JsonDeserializer<Throwable>
-      implements com.fasterxml.jackson.databind.deser.ResolvableDeserializer {
-    private final Class<?> targetClass;
-    private final JsonDeserializer<?> delegate;
+  /** Deserializes the compact format written by {@link ThrowableSerializer}. */
+  private static final class ThrowableDeserializer extends StdDeserializer<Throwable> {
 
-    ThrowableDeserializer(Class<?> targetClass, JsonDeserializer<?> delegate) {
-      this.targetClass = targetClass;
-      this.delegate = delegate;
-    }
-
-    @Override
-    public void resolve(DeserializationContext ctxt)
-        throws com.fasterxml.jackson.databind.JsonMappingException {
-      if (delegate instanceof com.fasterxml.jackson.databind.deser.ResolvableDeserializer) {
-        ((com.fasterxml.jackson.databind.deser.ResolvableDeserializer) delegate).resolve(ctxt);
-      }
+    ThrowableDeserializer() {
+      super(Throwable.class);
     }
 
     @Override
     public Throwable deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
-      JsonNode node = p.getCodec().readTree(p);
-
-      if (node.isObject() && node.has("class")) {
-        // Compact Cadence format: reuse the shared path so type, stack trace and cause survive.
-        ObjectMapper active = (ObjectMapper) p.getCodec();
-        return throwableFromJsonNode((ObjectNode) node, active);
+      JsonNode node = ctxt.readTree(p);
+      if (!node.isObject()) {
+        return ctxt.reportInputMismatch(
+            Throwable.class, "Expected JSON object for Throwable, found %s", node.getNodeType());
       }
+      return throwableFromJsonNode((ObjectNode) node, ctxt);
+    }
 
-      String message = null;
-      if (node.has("detailMessage")) {
-        message = node.get("detailMessage").asText();
-      }
-
-      Throwable result = null;
-
-      // Try delegate first to preserve subclass type and fields
-      if (delegate != null) {
-        try {
-          JsonParser nodeParser = node.traverse(p.getCodec());
-          nodeParser.nextToken();
-          result = (Throwable) delegate.deserialize(nodeParser, ctxt);
-        } catch (Exception e) {
-          // Delegate failed — fall through to constructor-based construction
-          log.debug("Delegate deserialization failed for {}, falling back.", targetClass, e);
-        }
-      }
-
-      // Fall back to constructor-based construction
-      if (result == null) {
-        try {
-          Constructor<?> constructor = targetClass.getDeclaredConstructor(String.class);
-          constructor.setAccessible(true);
-          result = (Throwable) constructor.newInstance(message);
-        } catch (Exception e1) {
-          try {
-            Constructor<?> constructor = targetClass.getDeclaredConstructor();
-            constructor.setAccessible(true);
-            result = (Throwable) constructor.newInstance();
-          } catch (Exception e2) {
-            result = new RuntimeException(message);
-          }
-        }
-      }
-
-      // Handle suppressed exceptions
-      if (node.has("suppressedExceptions") && node.get("suppressedExceptions").isArray()) {
-        for (JsonNode suppressed : node.get("suppressedExceptions")) {
-          try {
-            if (suppressed.has("detailMessage")) {
-              result.addSuppressed(new RuntimeException(suppressed.get("detailMessage").asText()));
-            }
-          } catch (Exception e) {
-            // ignore
-          }
-        }
-      }
-
-      return result;
+    @Override
+    public boolean isCachable() {
+      return true;
     }
   }
 }

@@ -20,17 +20,20 @@ package com.uber.cadence.workflow;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
 import com.google.common.base.Splitter;
 import com.uber.cadence.EventType;
 import com.uber.cadence.HistoryEvent;
+import com.uber.cadence.TimeoutType;
 import com.uber.cadence.WorkflowExecution;
 import com.uber.cadence.activity.ActivityOptions;
 import com.uber.cadence.activity.LocalActivityOptions;
 import com.uber.cadence.client.WorkflowClient;
 import com.uber.cadence.client.WorkflowClientOptions;
+import com.uber.cadence.client.WorkflowFailureException;
 import com.uber.cadence.client.WorkflowStub;
 import com.uber.cadence.common.RetryOptions;
 import com.uber.cadence.common.WorkflowExecutionHistory;
@@ -40,6 +43,7 @@ import com.uber.cadence.converter.JacksonDataConverter;
 import com.uber.cadence.converter.JsonDataConverter;
 import com.uber.cadence.internal.common.WorkflowExecutionUtils;
 import com.uber.cadence.testUtils.TestEnvironment;
+import com.uber.cadence.testing.SimulatedTimeoutException;
 import com.uber.cadence.testing.TestEnvironmentOptions;
 import com.uber.cadence.testing.TestWorkflowEnvironment;
 import com.uber.cadence.worker.Worker;
@@ -172,6 +176,13 @@ public class DataConverterIntegrationTest {
   }
 
   @Test
+  public void testWorkflowRetryDoesNotRetryException() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    assertEquals(codeExceptionDescription("rejectWithCode"), runScenario(Scenario.DO_NOT_RETRY));
+    assertEquals(1, activities.rejectCalls.get());
+  }
+
+  @Test
   public void testVoidWorkflowResult() throws Exception {
     client.newWorkflowStub(VoidWorkflow.class).run();
 
@@ -195,6 +206,49 @@ public class DataConverterIntegrationTest {
   }
 
   @Test
+  public void testActivityFailureCause() throws Exception {
+    assertEquals(
+        codeExceptionDescription("rejectWithCode"), runScenario(Scenario.CATCH_ACTIVITY_FAILURE));
+  }
+
+  @Test
+  public void testSimulatedActivityTimeout() throws Exception {
+    assertEquals("HEARTBEAT heartbeat details", runScenario(Scenario.ACTIVITY_TIMEOUT));
+  }
+
+  @Test
+  public void testChildWorkflowFailureCause() throws Exception {
+    assertEquals(codeExceptionDescription("run"), runScenario(Scenario.CHILD_FAILURE));
+  }
+
+  @Test
+  public void testWorkflowFailureCause() throws Exception {
+    FailingWorkflow failing = client.newWorkflowStub(FailingWorkflow.class);
+    WorkflowClient.start(failing::run);
+    try {
+      resultOf(failing, String.class);
+      fail("WorkflowFailureException expected");
+    } catch (WorkflowFailureException e) {
+      assertCodeException(e.getCause());
+    }
+  }
+
+  @Test
+  public void testWorkflowFailureCausedByActivityFailure() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    ScenarioWorkflow workflow = startScenario(Scenario.THROW_ACTIVITY_FAILURE);
+    try {
+      resultOf(workflow, String.class);
+      fail("WorkflowFailureException expected");
+    } catch (WorkflowFailureException e) {
+      assertEquals(ActivityFailureException.class, e.getCause().getClass());
+      ActivityFailureException failure = (ActivityFailureException) e.getCause();
+      assertEquals("TestActivities::rejectWithCode", failure.getActivityType().getName());
+      assertCodeException(failure.getCause());
+    }
+  }
+
+  @Test
   public void testSetKeepsIterationOrder() throws Exception {
     // Item has no hashCode, so a HashSet would iterate in a different order in every decision
     // task, and activity results would be attributed to the wrong items on replay.
@@ -208,6 +262,15 @@ public class DataConverterIntegrationTest {
     ItemsWorkflow workflow = client.newWorkflowStub(ItemsWorkflow.class);
     WorkflowClient.start(workflow::run, items);
     assertEquals(String.join(", ", expected), resultOf(workflow, String.class));
+  }
+
+  @Test
+  public void testExceptionTypedField() throws Exception {
+    OutcomeWorkflow workflow = client.newWorkflowStub(OutcomeWorkflow.class);
+    WorkflowClient.start(workflow::run);
+    Outcome outcome = resultOf(workflow, Outcome.class);
+    assertEquals("rejected", outcome.status);
+    assertCodeException(outcome.error);
   }
 
   private TestWorkflowEnvironment newEnvironment(DataConverter dataConverter) {
@@ -231,7 +294,11 @@ public class DataConverterIntegrationTest {
     TestWorkflowEnvironment environment = newEnvironment(dataConverter);
     Worker worker = environment.newWorker(TASK_LIST);
     worker.registerWorkflowImplementationTypes(
-        ScenarioWorkflowImpl.class, VoidWorkflowImpl.class, ItemsWorkflowImpl.class);
+        ScenarioWorkflowImpl.class,
+        VoidWorkflowImpl.class,
+        FailingWorkflowImpl.class,
+        ItemsWorkflowImpl.class,
+        OutcomeWorkflowImpl.class);
     worker.registerActivitiesImplementations(activitiesImpl);
     environment.start();
     return environment;
@@ -309,10 +376,48 @@ public class DataConverterIntegrationTest {
     }
   }
 
+  private static void assertCodeException(Throwable failure) {
+    assertEquals(CodeException.class, failure.getClass());
+    assertEquals("rejected (code 42)", failure.getMessage());
+    assertEquals(42, ((CodeException) failure).getCode());
+  }
+
+  private static String codeExceptionDescription(String thrownBy) {
+    return CodeException.class.getName() + ": rejected (code 42), code 42, at " + thrownBy;
+  }
+
   static TestActivities newActivityStub() {
     return Workflow.newActivityStub(
         TestActivities.class,
         new ActivityOptions.Builder().setScheduleToCloseTimeout(Duration.ofSeconds(30)).build());
+  }
+
+  /** Describes a failure received by workflow code, so that tests can assert on it. */
+  static String describe(Throwable failure) {
+    StringBuilder result =
+        new StringBuilder(failure.getClass().getName()).append(": ").append(failure.getMessage());
+    if (failure instanceof CodeException) {
+      result.append(", code ").append(((CodeException) failure).getCode());
+    }
+    StackTraceElement[] stackTrace = failure.getStackTrace();
+    if (stackTrace.length > 0) {
+      result.append(", at ").append(stackTrace[0].getMethodName());
+    }
+    return result.toString();
+  }
+
+  /** Has no (String) or no-arg constructor, and its constructor decorates the message. */
+  public static class CodeException extends RuntimeException {
+    private final int code;
+
+    public CodeException(String message, int code) {
+      super(message + " (code " + code + ")");
+      this.code = code;
+    }
+
+    public int getCode() {
+      return code;
+    }
   }
 
   /** Has no hashCode, so its hash code differs in every decoded instance. */
@@ -332,17 +437,38 @@ public class DataConverterIntegrationTest {
     }
   }
 
+  public static final class Outcome {
+    private final String status;
+    private final CodeException error;
+
+    public Outcome(String status, CodeException error) {
+      this.status = status;
+      this.error = error;
+    }
+
+    private Outcome() {
+      this(null, null);
+    }
+  }
+
   public interface TestActivities {
     String failOnce();
 
     String failTwice();
 
+    String rejectWithCode();
+
+    String timeOutWithDetails();
+
     String tag(Item item);
+
+    Outcome outcome();
   }
 
   public static class TestActivitiesImpl implements TestActivities {
     final AtomicInteger failOnceCalls = new AtomicInteger();
     final AtomicInteger failTwiceCalls = new AtomicInteger();
+    final AtomicInteger rejectCalls = new AtomicInteger();
 
     @Override
     public String failOnce() {
@@ -361,8 +487,24 @@ public class DataConverterIntegrationTest {
     }
 
     @Override
+    public String rejectWithCode() {
+      rejectCalls.incrementAndGet();
+      throw new CodeException("rejected", 42);
+    }
+
+    @Override
+    public String timeOutWithDetails() {
+      throw new SimulatedTimeoutException(TimeoutType.HEARTBEAT, "heartbeat details");
+    }
+
+    @Override
     public String tag(Item item) {
       return "tag(" + item.getName() + ")";
+    }
+
+    @Override
+    public Outcome outcome() {
+      return new Outcome("rejected", new CodeException("rejected", 42));
     }
   }
 
@@ -371,7 +513,12 @@ public class DataConverterIntegrationTest {
     VERSION,
     MUTABLE_SIDE_EFFECT,
     RETRY,
+    DO_NOT_RETRY,
+    CATCH_ACTIVITY_FAILURE,
+    THROW_ACTIVITY_FAILURE,
+    ACTIVITY_TIMEOUT,
     VOID_CHILD,
+    CHILD_FAILURE,
     MARKERS
   }
 
@@ -398,8 +545,30 @@ public class DataConverterIntegrationTest {
           return mutableSideEffect();
         case RETRY:
           return Workflow.retry(retryOptions(Duration.ofSeconds(1)), activities::failTwice);
+        case DO_NOT_RETRY:
+          return doNotRetry();
+        case CATCH_ACTIVITY_FAILURE:
+          try {
+            return activities.rejectWithCode();
+          } catch (ActivityFailureException e) {
+            return describe(e.getCause());
+          }
+        case THROW_ACTIVITY_FAILURE:
+          return activities.rejectWithCode();
+        case ACTIVITY_TIMEOUT:
+          try {
+            return activities.timeOutWithDetails();
+          } catch (ActivityTimeoutException e) {
+            return e.getTimeoutType() + " " + e.getDetails(String.class);
+          }
         case VOID_CHILD:
           return voidChild();
+        case CHILD_FAILURE:
+          try {
+            return Workflow.newChildWorkflowStub(FailingWorkflow.class).run();
+          } catch (ChildWorkflowFailureException e) {
+            return describe(e.getCause());
+          }
         case MARKERS:
           return markers();
       }
@@ -427,6 +596,20 @@ public class DataConverterIntegrationTest {
       Integer second =
           Workflow.mutableSideEffect("value", Integer.class, (stored, value) -> false, () -> 8);
       return first + "/" + second;
+    }
+
+    private String doNotRetry() {
+      RetryOptions options =
+          new RetryOptions.Builder()
+              .setInitialInterval(Duration.ofSeconds(1))
+              .setMaximumAttempts(3)
+              .setDoNotRetry(CodeException.class)
+              .build();
+      try {
+        return Workflow.retry(options, activities::rejectWithCode);
+      } catch (ActivityFailureException e) {
+        return describe(e.getCause());
+      }
     }
 
     private String markers() {
@@ -467,6 +650,21 @@ public class DataConverterIntegrationTest {
     public void run() {}
   }
 
+  public interface FailingWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    String run();
+  }
+
+  public static class FailingWorkflowImpl implements FailingWorkflow {
+    @Override
+    public String run() {
+      throw new CodeException("rejected", 42);
+    }
+  }
+
   public interface ItemsWorkflow {
     @WorkflowMethod(
       executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
@@ -485,6 +683,21 @@ public class DataConverterIntegrationTest {
         results.add(item.getName() + " -> " + activities.tag(item));
       }
       return String.join(", ", results);
+    }
+  }
+
+  public interface OutcomeWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    Outcome run();
+  }
+
+  public static class OutcomeWorkflowImpl implements OutcomeWorkflow {
+    @Override
+    public Outcome run() {
+      return newActivityStub().outcome();
     }
   }
 
