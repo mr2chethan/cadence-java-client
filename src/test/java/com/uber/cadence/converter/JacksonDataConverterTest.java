@@ -22,10 +22,24 @@ import static org.junit.Assert.*;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.uber.cadence.ActivityType;
+import com.uber.cadence.TimeoutType;
+import com.uber.cadence.WorkflowExecution;
+import com.uber.cadence.WorkflowType;
 import com.uber.cadence.client.ApplicationFailureException;
+import com.uber.cadence.client.WorkflowFailureException;
+import com.uber.cadence.workflow.ActivityFailureException;
+import com.uber.cadence.workflow.ActivityTimeoutException;
+import com.uber.cadence.workflow.ChildWorkflowFailureException;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.NoSuchFileException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -40,9 +54,15 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IllegalFormatConversionException;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.MissingResourceException;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
@@ -442,13 +462,6 @@ public class JacksonDataConverterTest {
       this.errorDetail = errorDetail;
     }
 
-    // For deserialization fallback
-    public DetailedException(String message) {
-      super(message);
-      this.errorCode = 0;
-      this.errorDetail = null;
-    }
-
     public int getErrorCode() {
       return errorCode;
     }
@@ -580,6 +593,18 @@ public class JacksonDataConverterTest {
     }
   }
 
+  @Test
+  public void testJsonNullDecodesAsNullException() {
+    byte[] nullJson = converter.toData((Object) null);
+    assertNull(converter.fromData(nullJson, RuntimeException.class, RuntimeException.class));
+    assertNull(converter.fromData(nullJson, Throwable.class, Throwable.class));
+
+    byte[] data = converter.toData("x", null);
+    assertArrayEquals(
+        new Object[] {"x", null},
+        converter.fromDataArray(data, String.class, RuntimeException.class));
+  }
+
   // -------- Sets keep the order of the payload --------
 
   public enum Color {
@@ -697,7 +722,678 @@ public class JacksonDataConverterTest {
         REVERSED_COLORS, asString(converter.toData(new LinkedHashSet<>(reversedColors()))));
   }
 
+  // -------- Exceptions keep their exact type, message, fields, cause and suppressed --------
+
+  /** Has neither a (String) nor a no-arg constructor. */
+  public static class OrderFailedException extends RuntimeException {
+    private final int code;
+    private final LocalDate date;
+
+    public OrderFailedException(String message, int code, LocalDate date, Throwable cause) {
+      super(message, cause);
+      this.code = code;
+      this.date = date;
+    }
+
+    public int getCode() {
+      return code;
+    }
+
+    public LocalDate getDate() {
+      return date;
+    }
+  }
+
+  /** Its only constructor formats the message. */
+  public static class OrderNotFoundException extends RuntimeException {
+    private final String orderId;
+
+    public OrderNotFoundException(String orderId) {
+      super("Order not found: " + orderId);
+      this.orderId = orderId;
+    }
+
+    public String getOrderId() {
+      return orderId;
+    }
+  }
+
+  public static class DecoratedMessageException extends RuntimeException {
+    public DecoratedMessageException(String message) {
+      super(message);
+    }
+
+    @Override
+    public String getMessage() {
+      return "[decorated] " + super.getMessage();
+    }
+  }
+
+  public static class OptionalFieldsException extends RuntimeException {
+    private final Optional<String> hint;
+    private final OptionalInt retries;
+    private final OptionalLong limit;
+    private final OptionalDouble ratio;
+
+    public OptionalFieldsException(
+        String message,
+        Optional<String> hint,
+        OptionalInt retries,
+        OptionalLong limit,
+        OptionalDouble ratio) {
+      super(message);
+      this.hint = hint;
+      this.retries = retries;
+      this.limit = limit;
+      this.ratio = ratio;
+    }
+  }
+
+  private static final LocalDate ORDER_DATE = LocalDate.of(2025, 4, 15);
+  private static final ActivityType ACTIVITY_TYPE =
+      new ActivityType().setName("Activities::charge");
+  private static final WorkflowExecution EXECUTION =
+      new WorkflowExecution().setWorkflowId("workflow-1").setRunId("run-1");
+
+  /**
+   * Decodes the exception through its own class and through Throwable and checks that both give the
+   * exact class and message. Note that toData clears the cause of the exception it encodes.
+   */
+  private <T extends Throwable> T roundTrip(T exception) {
+    @SuppressWarnings("unchecked")
+    Class<T> type = (Class<T>) exception.getClass();
+    String message = exception.getMessage();
+    byte[] data = converter.toData(exception);
+
+    Throwable asThrowable = converter.fromData(data, Throwable.class, Throwable.class);
+    assertEquals(type, asThrowable.getClass());
+    assertEquals(message, asThrowable.getMessage());
+
+    Throwable result = converter.fromData(data, type, type);
+    assertEquals(type, result.getClass());
+    assertEquals(message, result.getMessage());
+    return type.cast(result);
+  }
+
+  private static void assertSameFrame(StackTraceElement expected, StackTraceElement actual) {
+    assertEquals(expected.getClassName(), actual.getClassName());
+    assertEquals(expected.getMethodName(), actual.getMethodName());
+    assertEquals(expected.getFileName(), actual.getFileName());
+    assertEquals(expected.getLineNumber(), actual.getLineNumber());
+  }
+
+  private static void assertSameStackTrace(Throwable expected, Throwable actual) {
+    assertEquals(expected.getStackTrace().length, actual.getStackTrace().length);
+    assertSameFrame(expected.getStackTrace()[0], actual.getStackTrace()[0]);
+  }
+
+  @Test
+  public void testExceptionWithoutStringOrNoArgConstructor() {
+    IllegalStateException cause = new IllegalStateException("root");
+    OrderFailedException exception = new OrderFailedException("order failed", 7, ORDER_DATE, cause);
+
+    OrderFailedException result = roundTrip(exception);
+    assertEquals(7, result.getCode());
+    assertEquals(ORDER_DATE, result.getDate());
+    assertSameStackTrace(exception, result);
+    assertEquals(IllegalStateException.class, result.getCause().getClass());
+    assertEquals("root", result.getCause().getMessage());
+    assertSameStackTrace(cause, result.getCause());
+  }
+
+  @Test
+  public void testFormattingConstructorDoesNotChangeMessage() {
+    OrderNotFoundException result = roundTrip(new OrderNotFoundException("42"));
+    assertEquals("Order not found: 42", result.getMessage());
+    assertEquals("42", result.getOrderId());
+  }
+
+  @Test
+  public void testNullMessageStaysNull() {
+    IllegalStateException exception = new IllegalStateException((String) null);
+    exception.initCause(new IOException("io"));
+
+    IllegalStateException result = roundTrip(exception);
+    assertNull(result.getMessage());
+    assertEquals("java.lang.IllegalStateException", result.toString());
+    assertEquals(IOException.class, result.getCause().getClass());
+    assertEquals("io", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testOverriddenGetMessageIsNotAppliedTwice() {
+    DecoratedMessageException exception = new DecoratedMessageException("m");
+    byte[] data = converter.toData(exception);
+    assertTrue(asString(data), asString(data).contains("\"detailMessage\":\"m\""));
+
+    DecoratedMessageException result = roundTrip(exception);
+    assertEquals("[decorated] m", result.getMessage());
+  }
+
+  @Test
+  public void testSuppressedExceptionsKeepTheirTypes() {
+    OrderFailedException exception = new OrderFailedException("outer", 1, ORDER_DATE, null);
+    OrderNotFoundException first = new OrderNotFoundException("o-1");
+    IllegalArgumentException second = new IllegalArgumentException("bad argument");
+    exception.addSuppressed(first);
+    exception.addSuppressed(second);
+
+    OrderFailedException result = roundTrip(exception);
+    assertNull(result.getCause());
+    Throwable[] suppressed = result.getSuppressed();
+    assertEquals(2, suppressed.length);
+    assertEquals(OrderNotFoundException.class, suppressed[0].getClass());
+    assertEquals("Order not found: o-1", suppressed[0].getMessage());
+    assertEquals("o-1", ((OrderNotFoundException) suppressed[0]).getOrderId());
+    assertSameStackTrace(first, suppressed[0]);
+    assertEquals(IllegalArgumentException.class, suppressed[1].getClass());
+    assertEquals("bad argument", suppressed[1].getMessage());
+    assertSameStackTrace(second, suppressed[1]);
+  }
+
+  @Test
+  public void testCauseChainKeepsExactTypes() {
+    OrderNotFoundException root = new OrderNotFoundException("o-2");
+    IllegalStateException middle = new IllegalStateException("middle", root);
+    OrderFailedException exception = new OrderFailedException("top", 2, ORDER_DATE, middle);
+
+    OrderFailedException result = roundTrip(exception);
+    Throwable resultMiddle = result.getCause();
+    assertEquals(IllegalStateException.class, resultMiddle.getClass());
+    assertEquals("middle", resultMiddle.getMessage());
+    Throwable resultRoot = resultMiddle.getCause();
+    assertEquals(OrderNotFoundException.class, resultRoot.getClass());
+    assertEquals("Order not found: o-2", resultRoot.getMessage());
+    assertEquals("o-2", ((OrderNotFoundException) resultRoot).getOrderId());
+    assertNull(resultRoot.getCause());
+  }
+
+  @Test
+  public void testUnparseableStackTraceLinesAreSkipped() {
+    String json =
+        "{\"class\":\"java.lang.IllegalStateException\",\"detailMessage\":\"m\","
+            + "\"stackTrace\":\"not a stack frame\\n"
+            + "com.example.Foo.bar(Foo.java:12)\\n"
+            + "\\tat garbage\\n"
+            + "com.example.Foo.baz(Unknown Source)\\n\","
+            + "\"suppressedExceptions\":[]}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, result.getClass());
+    StackTraceElement[] trace = result.getStackTrace();
+    assertEquals(2, trace.length);
+    assertSameFrame(new StackTraceElement("com.example.Foo", "bar", "Foo.java", 12), trace[0]);
+    assertSameFrame(new StackTraceElement("com.example.Foo", "baz", "Unknown Source", 0), trace[1]);
+  }
+
+  @Test
+  public void testActivityFailureException() {
+    OrderNotFoundException cause = new OrderNotFoundException("o-3");
+    ActivityFailureException exception =
+        new ActivityFailureException(
+            5, ACTIVITY_TYPE, "activity-1", cause, 3, Duration.ofSeconds(2));
+
+    ActivityFailureException result = roundTrip(exception);
+    assertEquals(5, result.getEventId());
+    assertEquals(ACTIVITY_TYPE, result.getActivityType());
+    assertEquals("activity-1", result.getActivityId());
+    assertEquals(3, result.getAttempt());
+    assertEquals(Duration.ofSeconds(2), result.getBackoff());
+    assertEquals(OrderNotFoundException.class, result.getCause().getClass());
+    assertEquals("Order not found: o-3", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testActivityTimeoutException() {
+    ActivityTimeoutException exception =
+        new ActivityTimeoutException(
+            6,
+            ACTIVITY_TYPE,
+            "activity-2",
+            TimeoutType.HEARTBEAT,
+            converter.toData("progress"),
+            converter);
+
+    ActivityTimeoutException result = roundTrip(exception);
+    assertEquals(6, result.getEventId());
+    assertEquals(ACTIVITY_TYPE, result.getActivityType());
+    assertEquals("activity-2", result.getActivityId());
+    assertEquals(TimeoutType.HEARTBEAT, result.getTimeoutType());
+    assertEquals("progress", result.getDetails(String.class));
+  }
+
+  @Test
+  public void testChildWorkflowFailureException() {
+    WorkflowType workflowType = new WorkflowType().setName("Child::run");
+    ActivityFailureException cause =
+        new ActivityFailureException(
+            5, ACTIVITY_TYPE, "activity-1", new IllegalStateException("x"));
+    ChildWorkflowFailureException exception =
+        new ChildWorkflowFailureException(7, EXECUTION, workflowType, cause);
+
+    ChildWorkflowFailureException result = roundTrip(exception);
+    assertEquals(7, result.getEventId());
+    assertEquals(EXECUTION, result.getWorkflowExecution());
+    assertEquals(workflowType, result.getWorkflowType());
+    assertEquals(ActivityFailureException.class, result.getCause().getClass());
+    assertEquals(IllegalStateException.class, result.getCause().getCause().getClass());
+  }
+
+  @Test
+  public void testWorkflowFailureException() {
+    WorkflowFailureException exception =
+        new WorkflowFailureException(
+            EXECUTION, Optional.of("Workflow::run"), 9, new OrderNotFoundException("o-4"));
+    WorkflowFailureException result = roundTrip(exception);
+    assertEquals(EXECUTION, result.getExecution());
+    assertEquals(9, result.getDecisionTaskCompletedEventId());
+    assertEquals(OrderNotFoundException.class, result.getCause().getClass());
+
+    WorkflowFailureException withoutType =
+        new WorkflowFailureException(EXECUTION, Optional.empty(), 10, new IllegalStateException());
+    assertEquals(Optional.empty(), roundTrip(withoutType).getWorkflowType());
+  }
+
+  @Test
+  public void testDataConverterException() {
+    DataConverterException exception =
+        new DataConverterException("conversion failed", new IllegalArgumentException("inner"));
+    DataConverterException result = roundTrip(exception);
+    assertEquals(IllegalArgumentException.class, result.getCause().getClass());
+    assertEquals("inner", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testSimulatedTimeoutExceptionInternal() throws Exception {
+    // Package-private in com.uber.cadence.internal.sync. Activities throw it to simulate a timeout
+    // and the workflow side has to recognize its type.
+    Class<? extends Throwable> type =
+        Class.forName("com.uber.cadence.internal.sync.SimulatedTimeoutExceptionInternal")
+            .asSubclass(Throwable.class);
+    Constructor<? extends Throwable> constructor =
+        type.getDeclaredConstructor(TimeoutType.class, byte[].class);
+    constructor.setAccessible(true);
+    Throwable exception =
+        constructor.newInstance(TimeoutType.START_TO_CLOSE, converter.toData("details"));
+
+    Throwable result = roundTrip(exception);
+    assertNull(result.getMessage());
+    Field timeoutType = type.getDeclaredField("timeoutType");
+    timeoutType.setAccessible(true);
+    assertEquals(TimeoutType.START_TO_CLOSE, timeoutType.get(result));
+    Field details = type.getDeclaredField("details");
+    details.setAccessible(true);
+    assertEquals(
+        "details", converter.fromData((byte[]) details.get(result), String.class, String.class));
+  }
+
+  @Test
+  public void testJdkExceptionsKeepTheirTypes() {
+    EnumConstantNotPresentException notPresent =
+        roundTrip(new EnumConstantNotPresentException(Color.class, "PURPLE"));
+    assertEquals(Color.class, notPresent.enumType());
+    assertEquals("PURPLE", notPresent.constantName());
+
+    String json =
+        "{\"class\":\"java.util.MissingResourceException\",\"detailMessage\":\"missing\","
+            + "\"className\":\"Bundle\",\"key\":\"k\",\"suppressedExceptions\":[]}";
+    Throwable missing = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals("missing", missing.getMessage());
+    if (isOpenToReflection(MissingResourceException.class)) {
+      assertEquals(MissingResourceException.class, missing.getClass());
+      assertEquals("Bundle", ((MissingResourceException) missing).getClassName());
+      assertEquals("k", ((MissingResourceException) missing).getKey());
+    } else {
+      // Its fields cannot be restored, and it has no (String) constructor.
+      assertEquals(ApplicationFailureException.class, missing.getClass());
+    }
+  }
+
+  /**
+   * Whether the package of the class is open to this code (not with JDK 16+ strong encapsulation).
+   */
+  private static boolean isOpenToReflection(Class<?> type) {
+    try {
+      type.getDeclaredFields()[0].setAccessible(true);
+      return true;
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
+  @Test
+  public void testJdkExceptionsWithPrivateState() {
+    // With strong encapsulation their fields cannot be restored. They must still have the right
+    // message and cause, and getMessage() must not fail.
+    assertEquals(
+        "d != java.lang.String",
+        decode(new IllegalFormatConversionException('d', String.class)).getMessage());
+
+    Throwable noSuchFile = decode(new NoSuchFileException("/tmp/x"));
+    assertEquals(NoSuchFileException.class, noSuchFile.getClass());
+    assertEquals("/tmp/x", noSuchFile.getMessage());
+
+    Throwable accessDenied = decode(new AccessDeniedException("/etc/shadow", null, "denied"));
+    assertEquals(AccessDeniedException.class, accessDenied.getClass());
+    assertEquals("/etc/shadow: denied", accessDenied.getMessage());
+
+    Throwable invocation = decode(new InvocationTargetException(new IOException("target")));
+    assertEquals(IOException.class, invocation.getCause().getClass());
+    assertEquals("target", invocation.getCause().getMessage());
+  }
+
+  private Throwable decode(Throwable exception) {
+    return converter.fromData(converter.toData(exception), Throwable.class, Throwable.class);
+  }
+
+  public static class BaseCodeException extends RuntimeException {
+    protected final int code;
+
+    BaseCodeException(String message, int code) {
+      super(message);
+      this.code = code;
+    }
+  }
+
+  public static class SubCodeException extends BaseCodeException {
+    // Hides BaseCodeException.code.
+    private final int code;
+
+    SubCodeException(String message, int baseCode, int code) {
+      super(message, baseCode);
+      this.code = code;
+    }
+  }
+
+  @Test
+  public void testHiddenFieldIsNotRestoredFromTheSubclassField() {
+    SubCodeException result = roundTrip(new SubCodeException("hidden", 1, 2));
+    assertEquals(2, result.code);
+  }
+
+  /** Has fields with the names of keys of the JSON of exceptions. */
+  public static class ReservedNamesException extends RuntimeException {
+    private final String cause;
+    private final String stackTrace;
+
+    ReservedNamesException(String message, Throwable cause) {
+      super(message, cause);
+      this.cause = "reserved cause";
+      this.stackTrace = "reserved stack";
+    }
+  }
+
+  @Test
+  public void testFieldsWithReservedNames() {
+    ReservedNamesException result =
+        roundTrip(new ReservedNamesException("reserved", new IOException("real cause")));
+    assertEquals("reserved", result.getMessage());
+    assertEquals(IOException.class, result.getCause().getClass());
+    // These fields cannot be written, so they are not restored from the keys of the exception.
+    assertNull(result.cause);
+    assertNull(result.stackTrace);
+  }
+
+  @Test
+  public void testUnknownExceptionClassBecomesApplicationFailure() {
+    String json =
+        "{\"class\":\"java.lang.IllegalStateException\",\"detailMessage\":\"outer\","
+            + "\"cause\":{\"class\":\"com.example.NoSuchException\",\"detailMessage\":\"lost\"}}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, result.getClass());
+    assertEquals(ApplicationFailureException.class, result.getCause().getClass());
+    assertEquals("lost", result.getCause().getMessage());
+
+    // An abstract class cannot be instantiated either.
+    String abstractJson =
+        "{\"class\":\"com.uber.cadence.workflow.ActivityException\",\"detailMessage\":\"abs\"}";
+    Throwable abstractResult =
+        converter.fromData(utf8(abstractJson), Throwable.class, Throwable.class);
+    assertEquals(ApplicationFailureException.class, abstractResult.getClass());
+    assertEquals("abs", abstractResult.getMessage());
+  }
+
+  @Test
+  public void testInvalidExceptionJsonFails() {
+    List<String> invalid =
+        Arrays.asList(
+            "{\"class\":\"java.lang.String\",\"detailMessage\":\"m\"}",
+            "{\"detailMessage\":\"m\"}",
+            "{\"class\":null,\"detailMessage\":\"m\"}",
+            "\"text\"",
+            "[1]",
+            "42");
+    for (String json : invalid) {
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), RuntimeException.class, RuntimeException.class));
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), Throwable.class, Throwable.class));
+    }
+  }
+
+  @Test
+  public void testExceptionInDataArray() {
+    byte[] data = converter.toData("x", new OrderFailedException("failed", 4, ORDER_DATE, null), 5);
+    Object[] result =
+        converter.fromDataArray(data, String.class, OrderFailedException.class, int.class);
+    assertEquals("x", result[0]);
+    assertEquals(OrderFailedException.class, result[1].getClass());
+    assertEquals(4, ((OrderFailedException) result[1]).getCode());
+    assertEquals(5, result[2]);
+  }
+
+  @Test
+  public void testExceptionOptionalFields() {
+    // Missing, null and invalid values leave an empty Optional rather than null.
+    String className = OptionalFieldsException.class.getName();
+    List<String> jsons =
+        Arrays.asList(
+            "{\"class\":\"" + className + "\",\"detailMessage\":\"m\"}",
+            "{\"class\":\""
+                + className
+                + "\",\"detailMessage\":\"m\","
+                + "\"hint\":null,\"retries\":null,\"limit\":null,\"ratio\":null}",
+            "{\"class\":\""
+                + className
+                + "\",\"detailMessage\":\"m\","
+                + "\"hint\":{\"a\":1},\"retries\":[1],\"limit\":\"x\",\"ratio\":{}}");
+    for (String json : jsons) {
+      OptionalFieldsException empty =
+          converter.fromData(
+              utf8(json), OptionalFieldsException.class, OptionalFieldsException.class);
+      assertEquals(json, "m", empty.getMessage());
+      assertEquals(json, Optional.empty(), empty.hint);
+      assertEquals(json, OptionalInt.empty(), empty.retries);
+      assertEquals(json, OptionalLong.empty(), empty.limit);
+      assertEquals(json, OptionalDouble.empty(), empty.ratio);
+    }
+  }
+
+  @Test
+  public void testExceptionEncodedByJsonDataConverter() {
+    DetailedException exception = new DetailedException("failed", 42, "extra detail");
+    exception.initCause(new IllegalStateException("cause"));
+    byte[] data = JsonDataConverter.getInstance().toData(exception);
+
+    DetailedException result =
+        converter.fromData(data, DetailedException.class, DetailedException.class);
+    assertEquals(DetailedException.class, result.getClass());
+    assertEquals("failed", result.getMessage());
+    assertEquals(42, result.getErrorCode());
+    assertEquals("extra detail", result.getErrorDetail());
+    assertSameStackTrace(exception, result);
+    assertEquals(IllegalStateException.class, result.getCause().getClass());
+    assertEquals("cause", result.getCause().getMessage());
+  }
+
+  // -------- Exceptions with a no-arg constructor --------
+
+  /** Its no-arg constructor sets a default message, and its fields have initializers. */
+  public static class InitializedException extends RuntimeException {
+    private final transient List<String> context = new ArrayList<>();
+    private String code = "DEFAULT";
+    private String detail = "initial";
+
+    public InitializedException() {
+      super("default message");
+    }
+
+    InitializedException(String message, String code, String detail) {
+      super(message);
+      this.code = code;
+      this.detail = detail;
+    }
+  }
+
+  @Test
+  public void testNoArgConstructorOfExceptionIsUsed() {
+    InitializedException original = new InitializedException("failed", "E42", "detail");
+    InitializedException result =
+        converter.fromData(
+            converter.toData(original), InitializedException.class, InitializedException.class);
+    assertEquals(InitializedException.class, result.getClass());
+    assertEquals("failed", result.getMessage());
+    assertEquals("E42", result.code);
+    assertEquals("detail", result.detail);
+    // Transient fields are not serialized, and keep the value the constructor gave them.
+    assertEquals(Collections.emptyList(), result.context);
+    assertSameStackTrace(original, result);
+  }
+
+  @Test
+  public void testMissingAndNullFieldsOfExceptionWithNoArgConstructor() {
+    String json =
+        "{\"detailMessage\":null,\"detail\":null,\"stackTrace\":\"\",\"suppressedExceptions\":[],"
+            + "\"class\":\""
+            + InitializedException.class.getName()
+            + "\"}";
+    InitializedException result =
+        converter.fromData(utf8(json), InitializedException.class, InitializedException.class);
+    assertNull(result.getMessage());
+    // A field missing in the JSON keeps its initial value, a null one is set to null.
+    assertEquals("DEFAULT", result.code);
+    assertNull(result.detail);
+    assertNotNull(result.context);
+  }
+
+  /** Its no-arg constructor sets a cause. */
+  public static class PresetCauseException extends RuntimeException {
+    public PresetCauseException() {
+      super("preset", new IllegalArgumentException("preset cause"));
+    }
+
+    PresetCauseException(String message, Throwable cause) {
+      super(message, cause);
+    }
+  }
+
+  @Test
+  public void testCauseSetByNoArgConstructorIsReplaced() {
+    PresetCauseException original =
+        new PresetCauseException("failed", new IOException("actual cause"));
+    PresetCauseException result =
+        converter.fromData(
+            converter.toData(original), PresetCauseException.class, PresetCauseException.class);
+    assertEquals("failed", result.getMessage());
+    assertEquals(IOException.class, result.getCause().getClass());
+    assertEquals("actual cause", result.getCause().getMessage());
+
+    // Without a cause in the JSON, the one set by the constructor is removed.
+    PresetCauseException withoutCause =
+        converter.fromData(
+            converter.toData(new PresetCauseException("no cause", null)),
+            PresetCauseException.class,
+            PresetCauseException.class);
+    assertEquals("no cause", withoutCause.getMessage());
+    assertNull(withoutCause.getCause());
+  }
+
   // -------- Unusual payloads --------
+
+  @Test
+  public void testExceptionJsonWithoutOptionalParts() {
+    String json =
+        "{\"code\":null,\"cause\":null,"
+            + "\"suppressedExceptions\":[null,{\"class\":\"java.io.IOException\"}],"
+            + "\"class\":\""
+            + OrderFailedException.class.getName()
+            + "\"}";
+    OrderFailedException result =
+        converter.fromData(utf8(json), OrderFailedException.class, OrderFailedException.class);
+    assertNull(result.getMessage());
+    // A primitive field that is null in the JSON keeps its value.
+    assertEquals(0, result.getCode());
+    assertNull(result.getDate());
+    assertNull(result.getCause());
+    assertEquals(0, result.getStackTrace().length);
+    assertEquals(1, result.getSuppressed().length);
+    assertEquals(IOException.class, result.getSuppressed()[0].getClass());
+
+    String withoutSuppressed =
+        "{\"suppressedExceptions\":null,\"class\":\"java.lang.IllegalStateException\"}";
+    Throwable noSuppressed =
+        converter.fromData(utf8(withoutSuppressed), Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, noSuppressed.getClass());
+    assertEquals(0, noSuppressed.getSuppressed().length);
+  }
+
+  @Test
+  public void testExceptionWithoutCauseEncodedByJsonDataConverter() {
+    byte[] data = JsonDataConverter.getInstance().toData(new IllegalStateException("no cause"));
+    Throwable result = converter.fromData(data, Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, result.getClass());
+    assertEquals("no cause", result.getMessage());
+    assertNull(result.getCause());
+  }
+
+  /** Has a synthetic field that references the enclosing instance. */
+  @SuppressWarnings("ClassCanBeStatic")
+  public class InnerException extends RuntimeException {
+    private final int code;
+
+    public InnerException(String message, int code) {
+      super(message);
+      this.code = code;
+    }
+  }
+
+  @Test
+  public void testNonStaticInnerException() {
+    InnerException result =
+        converter.fromData(
+            converter.toData(new InnerException("inner", 3)),
+            InnerException.class,
+            InnerException.class);
+    assertEquals(InnerException.class, result.getClass());
+    assertEquals("inner", result.getMessage());
+    assertEquals(3, result.code);
+  }
+
+  static int failToInitialize() {
+    throw new IllegalStateException("cannot initialize");
+  }
+
+  public static class BrokenException extends RuntimeException {
+    static final int VALUE = failToInitialize();
+
+    public BrokenException() {}
+
+    public BrokenException(String message) {
+      super(message);
+    }
+  }
+
+  @Test
+  public void testClassesThatFailToInitialize() {
+    String json =
+        "{\"detailMessage\":\"broken\",\"class\":\"" + BrokenException.class.getName() + "\"}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(ApplicationFailureException.class, result.getClass());
+    assertEquals("broken", result.getMessage());
+  }
 
   public static class ConverterAndClass {
     DataConverter converter;
@@ -748,6 +1444,12 @@ public class JacksonDataConverterTest {
             mapper -> mapper.copy().registerModule(new SimpleModule("application-module")));
     for (Function<ObjectMapper, ObjectMapper> interceptor : interceptors) {
       DataConverter custom = new JacksonDataConverter(interceptor);
+
+      byte[] exception = custom.toData(new OrderFailedException("custom", 8, ORDER_DATE, null));
+      Throwable result = custom.fromData(exception, Throwable.class, Throwable.class);
+      assertEquals(OrderFailedException.class, result.getClass());
+      assertEquals("custom", result.getMessage());
+      assertEquals(8, ((OrderFailedException) result).getCode());
 
       Type setOfColors = new TypeReference<Set<Color>>() {}.getType();
       @SuppressWarnings("unchecked")
