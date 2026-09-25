@@ -355,6 +355,35 @@ test {
     }
 }
 
+// Runs the data converter tests the way JDK 16+ runs them: java.base packages are closed to
+// reflection, except java.lang, which the client itself needs opened (--add-opens).
+task dataConverterStrictEncapsulationTest(type: Test) {
+    description = 'Runs the JacksonDataConverter tests with JDK 16+ strong encapsulation.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    // JDK 8 does not know these flags.
+    onlyIf { JavaVersion.current().isJava9Compatible() }
+    jvmArgs '--illegal-access=deny', '--add-opens', 'java.base/java.lang=ALL-UNNAMED'
+    // JsonDataConverter cannot handle java.time values when java.base/java.time is not opened.
+    systemProperty 'cadence.test.converters', 'jackson'
+    filter {
+        includeTestsMatching 'com.uber.cadence.converter.JacksonDataConverter*Test'
+        includeTestsMatching 'com.uber.cadence.internal.replay.MarkerHandlerDataConverterTest'
+        includeTestsMatching 'com.uber.cadence.internal.common.LocalActivityMarkerDataConverterTest'
+        includeTestsMatching 'com.uber.cadence.common.RetryOptionsDataConverterTest'
+        includeTestsMatching 'com.uber.cadence.internal.shadowing.ReplayWorkflowActivityImplHeartbeatTest'
+        includeTestsMatching 'com.uber.cadence.workflow.DataConverterIntegrationTest'
+        includeTestsMatching 'com.uber.cadence.workflow.DataConverterCustomizationIntegrationTest'
+        includeTestsMatching 'com.uber.cadence.workflow.JacksonMigrationReplayTest'
+        includeTestsMatching 'com.uber.cadence.testing.WorkflowReplayerDataConverterTest'
+    }
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
+    }
+}
+
 jacoco {
     toolVersion = "0.8.2"
 }
