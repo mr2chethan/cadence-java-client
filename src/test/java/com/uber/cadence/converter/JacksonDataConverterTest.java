@@ -19,9 +19,16 @@ package com.uber.cadence.converter;
 
 import static org.junit.Assert.*;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
 import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.uber.cadence.ActivityType;
 import com.uber.cadence.TimeoutType;
 import com.uber.cadence.WorkflowExecution;
@@ -57,8 +64,10 @@ import java.util.HashMap;
 import java.util.IllegalFormatConversionException;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.MissingResourceException;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
@@ -67,6 +76,7 @@ import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import org.junit.Test;
 
@@ -722,6 +732,319 @@ public class JacksonDataConverterTest {
         REVERSED_COLORS, asString(converter.toData(new LinkedHashSet<>(reversedColors()))));
   }
 
+  // -------- Classes without a constructor Jackson can use --------
+
+  /** Immutable class with an all-args constructor only. */
+  public static final class ImmutableOrder {
+    static final AtomicInteger constructorCalls = new AtomicInteger();
+
+    private final String id;
+    private final int quantity;
+    private final List<String> items;
+
+    public ImmutableOrder(String id, int quantity, List<String> items) {
+      constructorCalls.incrementAndGet();
+      this.id = id;
+      this.quantity = quantity;
+      this.items = items;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (!(o instanceof ImmutableOrder)) {
+        return false;
+      }
+      ImmutableOrder that = (ImmutableOrder) o;
+      return quantity == that.quantity
+          && Objects.equals(id, that.id)
+          && Objects.equals(items, that.items);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(id, quantity, items);
+    }
+
+    @Override
+    public String toString() {
+      return "ImmutableOrder{" + id + ", " + quantity + ", " + items + "}";
+    }
+  }
+
+  /** Shaped like a Lombok {@code @Value} class: final fields and a package-private constructor. */
+  public static final class ValueStyle {
+    private final String name;
+    private final long amount;
+
+    ValueStyle(String name, long amount) {
+      this.name = name;
+      this.amount = amount;
+    }
+
+    public String getName() {
+      return name;
+    }
+
+    public long getAmount() {
+      return amount;
+    }
+  }
+
+  public static final class PrivateNoArgConstructor {
+    private String name;
+    private String createdBy;
+
+    private PrivateNoArgConstructor() {
+      createdBy = "constructor";
+    }
+  }
+
+  @SuppressWarnings("ClassCanBeStatic")
+  public class InnerValue {
+    private final String label;
+    private final int count;
+
+    public InnerValue(String label, int count) {
+      this.label = label;
+      this.count = count;
+    }
+
+    JacksonDataConverterTest outer() {
+      return JacksonDataConverterTest.this;
+    }
+  }
+
+  public static final class Box<T> {
+    private final T value;
+
+    public Box(T value) {
+      this.value = value;
+    }
+  }
+
+  /** Its only constructor takes a String, which Jackson uses for a JSON string. */
+  public static final class Sku {
+    private final String code;
+
+    public Sku(String code) {
+      this.code = code.toUpperCase(Locale.ROOT);
+    }
+  }
+
+  public static final class ExplicitCreator {
+    private final String value;
+
+    @JsonCreator
+    ExplicitCreator(@JsonProperty("value") String value) {
+      this.value = "created:" + value;
+    }
+  }
+
+  /** A JDK collection subclass without a no-arg constructor. */
+  public static final class TagList extends ArrayList<String> {
+    public TagList(String first) {
+      add(first);
+    }
+  }
+
+  public interface Shape {}
+
+  public abstract static class AbstractShape implements Shape {
+    int sides;
+  }
+
+  private static ImmutableOrder newOrder(String id) {
+    return new ImmutableOrder(id, 2, Arrays.asList("apple", "pear"));
+  }
+
+  @Test
+  public void testClassWithAllArgsConstructorOnly() {
+    ImmutableOrder order = newOrder("o-1");
+    byte[] data = converter.toData(order);
+    int constructorCalls = ImmutableOrder.constructorCalls.get();
+    ImmutableOrder result = converter.fromData(data, ImmutableOrder.class, ImmutableOrder.class);
+    assertEquals(order, result);
+    // Like Gson, the constructor is not run.
+    assertEquals(constructorCalls, ImmutableOrder.constructorCalls.get());
+  }
+
+  @Test
+  public void testValueStyleClass() {
+    byte[] data = converter.toData(new ValueStyle("fee", 12L));
+    ValueStyle result = converter.fromData(data, ValueStyle.class, ValueStyle.class);
+    assertEquals("fee", result.getName());
+    assertEquals(12L, result.getAmount());
+  }
+
+  @Test
+  public void testPrivateNoArgConstructorIsStillUsed() {
+    PrivateNoArgConstructor result =
+        converter.fromData(
+            utf8("{\"name\":\"n\"}"), PrivateNoArgConstructor.class, PrivateNoArgConstructor.class);
+    assertEquals("n", result.name);
+    assertEquals("constructor", result.createdBy);
+  }
+
+  @Test
+  public void testNonStaticInnerClass() {
+    byte[] data = converter.toData(new InnerValue("inner", 3));
+    InnerValue result = converter.fromData(data, InnerValue.class, InnerValue.class);
+    assertEquals("inner", result.label);
+    assertEquals(3, result.count);
+    assertNull(result.outer());
+  }
+
+  @Test
+  public void testGenericClassWithoutNoArgConstructor() {
+    Type type = new TypeReference<Box<ImmutableOrder>>() {}.getType();
+    byte[] data = converter.toData(new Box<>(newOrder("o-2")));
+    @SuppressWarnings("unchecked")
+    Box<ImmutableOrder> result = converter.fromData(data, Box.class, type);
+    assertEquals(newOrder("o-2"), result.value);
+  }
+
+  @Test
+  public void testClassesWithoutNoArgConstructorInContainers() {
+    List<ImmutableOrder> list = Arrays.asList(newOrder("a"), newOrder("b"));
+    Type listType = new TypeReference<List<ImmutableOrder>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    List<ImmutableOrder> listResult =
+        converter.fromData(converter.toData(list), List.class, listType);
+    assertEquals(list, listResult);
+
+    Map<String, ImmutableOrder> map = new HashMap<>();
+    map.put("c", newOrder("c"));
+    Type mapType = new TypeReference<Map<String, ImmutableOrder>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Map<String, ImmutableOrder> mapResult =
+        converter.fromData(converter.toData(map), Map.class, mapType);
+    assertEquals(map, mapResult);
+
+    ImmutableOrder[] array = {newOrder("d")};
+    ImmutableOrder[] arrayResult =
+        converter.fromData(
+            converter.toData((Object) array), ImmutableOrder[].class, ImmutableOrder[].class);
+    assertArrayEquals(array, arrayResult);
+
+    Object[] arguments =
+        converter.fromDataArray(
+            converter.toData("x", newOrder("e")), String.class, ImmutableOrder.class);
+    assertEquals(newOrder("e"), arguments[1]);
+  }
+
+  @Test
+  public void testClassWithStringConstructorOnly() {
+    // A JSON string goes through the constructor.
+    assertEquals("ABC", converter.fromData(utf8("\"abc\""), Sku.class, Sku.class).code);
+    // A JSON object sets the fields without running the constructor.
+    assertEquals("abc", converter.fromData(utf8("{\"code\":\"abc\"}"), Sku.class, Sku.class).code);
+    byte[] data = converter.toData(new Sku("xyz"));
+    assertEquals("XYZ", converter.fromData(data, Sku.class, Sku.class).code);
+  }
+
+  @Test
+  public void testExplicitCreatorIsStillUsed() {
+    ExplicitCreator result =
+        converter.fromData(utf8("{\"value\":\"a\"}"), ExplicitCreator.class, ExplicitCreator.class);
+    assertEquals("created:a", result.value);
+  }
+
+  @Test
+  public void testJdkSubclassWithoutNoArgConstructorIsNotInstantiated() {
+    // Skipping the constructors of a JDK class would leave its internal state uninitialized.
+    assertThrows(
+        DataConverterException.class,
+        () -> converter.fromData(utf8("[\"a\",\"b\"]"), TagList.class, TagList.class));
+  }
+
+  @Test
+  public void testAbstractTypesAreNotInstantiated() {
+    byte[] data = utf8("{\"sides\":3}");
+    assertThrows(
+        DataConverterException.class, () -> converter.fromData(data, Shape.class, Shape.class));
+    assertThrows(
+        DataConverterException.class,
+        () -> converter.fromData(data, AbstractShape.class, AbstractShape.class));
+  }
+
+  // -------- Optional --------
+
+  public static class OptionalHolder {
+    Optional<String> text;
+    Optional<SimplePojo> pojo;
+    OptionalInt count;
+    OptionalLong total;
+    OptionalDouble ratio;
+  }
+
+  @Test
+  public void testOptionalFieldsWithValues() {
+    OptionalHolder holder = new OptionalHolder();
+    holder.text = Optional.of("x");
+    holder.pojo = Optional.of(new SimplePojo("p", 1, Arrays.asList("t")));
+    holder.count = OptionalInt.of(3);
+    holder.total = OptionalLong.of(4L);
+    holder.ratio = OptionalDouble.of(0.5);
+
+    byte[] data = converter.toData(holder);
+    String json = asString(data);
+    // The contained value is written, as if the field were not an Optional.
+    assertTrue(json, json.contains("\"text\":\"x\""));
+    assertTrue(json, json.contains("\"pojo\":{\"name\":\"p\""));
+    assertTrue(json, json.contains("\"count\":3"));
+    assertTrue(json, json.contains("\"total\":4"));
+    assertTrue(json, json.contains("\"ratio\":0.5"));
+
+    OptionalHolder result = converter.fromData(data, OptionalHolder.class, OptionalHolder.class);
+    assertEquals(Optional.of("x"), result.text);
+    assertEquals(holder.pojo, result.pojo);
+    assertEquals(OptionalInt.of(3), result.count);
+    assertEquals(OptionalLong.of(4L), result.total);
+    assertEquals(OptionalDouble.of(0.5), result.ratio);
+  }
+
+  @Test
+  public void testEmptyOptionalFields() {
+    OptionalHolder holder = new OptionalHolder();
+    holder.text = Optional.empty();
+    holder.pojo = Optional.empty();
+    holder.count = OptionalInt.empty();
+    holder.total = OptionalLong.empty();
+    holder.ratio = OptionalDouble.empty();
+
+    byte[] data = converter.toData(holder);
+    assertEquals(
+        "{\"text\":null,\"pojo\":null,\"count\":null,\"total\":null,\"ratio\":null}",
+        asString(data));
+
+    OptionalHolder result = converter.fromData(data, OptionalHolder.class, OptionalHolder.class);
+    assertEquals(Optional.empty(), result.text);
+    assertEquals(Optional.empty(), result.pojo);
+    assertEquals(OptionalInt.empty(), result.count);
+    assertEquals(OptionalLong.empty(), result.total);
+    assertEquals(OptionalDouble.empty(), result.ratio);
+  }
+
+  @Test
+  public void testTopLevelOptional() {
+    Type optionalString = new TypeReference<Optional<String>>() {}.getType();
+    assertEquals("\"x\"", asString(converter.toData(Optional.of("x"))));
+    assertEquals("null", asString(converter.toData(Optional.empty())));
+    assertEquals("3", asString(converter.toData(OptionalInt.of(3))));
+    assertEquals(
+        Optional.of("x"), converter.fromData(utf8("\"x\""), Optional.class, optionalString));
+    assertEquals(
+        Optional.empty(), converter.fromData(utf8("null"), Optional.class, optionalString));
+    assertEquals(
+        OptionalInt.of(3), converter.fromData(utf8("3"), OptionalInt.class, OptionalInt.class));
+
+    Type listOfOptionals = new TypeReference<List<Optional<String>>>() {}.getType();
+    List<Optional<String>> list = Arrays.asList(Optional.of("a"), Optional.empty());
+    byte[] data = converter.toData(list);
+    assertEquals("[\"a\",null]", asString(data));
+    assertEquals(list, converter.fromData(data, List.class, listOfOptionals));
+  }
+
   // -------- Exceptions keep their exact type, message, fields, cause and suppressed --------
 
   /** Has neither a (String) nor a no-arg constructor. */
@@ -786,6 +1109,19 @@ public class JacksonDataConverterTest {
       this.retries = retries;
       this.limit = limit;
       this.ratio = ratio;
+    }
+  }
+
+  public static final class ExceptionHolder {
+    private final OrderFailedException failure;
+    private final List<OrderNotFoundException> notFound;
+    private final Exception other;
+
+    public ExceptionHolder(
+        OrderFailedException failure, List<OrderNotFoundException> notFound, Exception other) {
+      this.failure = failure;
+      this.notFound = notFound;
+      this.other = other;
     }
   }
 
@@ -985,6 +1321,7 @@ public class JacksonDataConverterTest {
             EXECUTION, Optional.of("Workflow::run"), 9, new OrderNotFoundException("o-4"));
     WorkflowFailureException result = roundTrip(exception);
     assertEquals(EXECUTION, result.getExecution());
+    assertEquals(Optional.of("Workflow::run"), result.getWorkflowType());
     assertEquals(9, result.getDecisionTaskCompletedEventId());
     assertEquals(OrderNotFoundException.class, result.getCause().getClass());
 
@@ -1175,6 +1512,27 @@ public class JacksonDataConverterTest {
   }
 
   @Test
+  public void testExceptionFieldsOfPojo() {
+    ExceptionHolder holder =
+        new ExceptionHolder(
+            new OrderFailedException("failed", 3, ORDER_DATE, new IllegalStateException("c")),
+            Arrays.asList(new OrderNotFoundException("a"), new OrderNotFoundException("b")),
+            new IllegalArgumentException("other"));
+
+    ExceptionHolder result =
+        converter.fromData(converter.toData(holder), ExceptionHolder.class, ExceptionHolder.class);
+    assertEquals(OrderFailedException.class, result.failure.getClass());
+    assertEquals("failed", result.failure.getMessage());
+    assertEquals(3, result.failure.getCode());
+    assertEquals(IllegalStateException.class, result.failure.getCause().getClass());
+    assertEquals(2, result.notFound.size());
+    assertEquals(OrderNotFoundException.class, result.notFound.get(1).getClass());
+    assertEquals("Order not found: b", result.notFound.get(1).getMessage());
+    assertEquals(IllegalArgumentException.class, result.other.getClass());
+    assertEquals("other", result.other.getMessage());
+  }
+
+  @Test
   public void testExceptionInDataArray() {
     byte[] data = converter.toData("x", new OrderFailedException("failed", 4, ORDER_DATE, null), 5);
     Object[] result =
@@ -1187,6 +1545,19 @@ public class JacksonDataConverterTest {
 
   @Test
   public void testExceptionOptionalFields() {
+    OptionalFieldsException exception =
+        new OptionalFieldsException(
+            "m",
+            Optional.of("retry later"),
+            OptionalInt.of(2),
+            OptionalLong.of(3L),
+            OptionalDouble.of(0.25));
+    OptionalFieldsException result = roundTrip(exception);
+    assertEquals(Optional.of("retry later"), result.hint);
+    assertEquals(OptionalInt.of(2), result.retries);
+    assertEquals(OptionalLong.of(3L), result.limit);
+    assertEquals(OptionalDouble.of(0.25), result.ratio);
+
     // Missing, null and invalid values leave an empty Optional rather than null.
     String className = OptionalFieldsException.class.getName();
     List<String> jsons =
@@ -1376,6 +1747,15 @@ public class JacksonDataConverterTest {
     throw new IllegalStateException("cannot initialize");
   }
 
+  public static class BrokenClass {
+    static final int VALUE = failToInitialize();
+    final String name;
+
+    BrokenClass(String name) {
+      this.name = name;
+    }
+  }
+
   public static class BrokenException extends RuntimeException {
     static final int VALUE = failToInitialize();
 
@@ -1388,11 +1768,53 @@ public class JacksonDataConverterTest {
 
   @Test
   public void testClassesThatFailToInitialize() {
+    assertThrows(
+        DataConverterException.class,
+        () -> converter.fromData(utf8("{\"name\":\"x\"}"), BrokenClass.class, BrokenClass.class));
+
     String json =
         "{\"detailMessage\":\"broken\",\"class\":\"" + BrokenException.class.getName() + "\"}";
     Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
     assertEquals(ApplicationFailureException.class, result.getClass());
     assertEquals("broken", result.getMessage());
+  }
+
+  public static class Tags {
+    final List<String> values;
+    final boolean fromCreator;
+
+    private Tags(List<String> values) {
+      this.values = values;
+      this.fromCreator = true;
+    }
+
+    @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+    public static Tags of(List<String> values) {
+      return new Tags(values);
+    }
+  }
+
+  public static class Attributes {
+    final Map<String, String> values;
+    final boolean fromCreator;
+
+    @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+    public Attributes(Map<String, String> values) {
+      this.values = values;
+      this.fromCreator = true;
+    }
+  }
+
+  @Test
+  public void testDelegatingCreatorsAreStillUsed() {
+    Tags tags = converter.fromData(utf8("[\"a\",\"b\"]"), Tags.class, Tags.class);
+    assertTrue(tags.fromCreator);
+    assertEquals(Arrays.asList("a", "b"), tags.values);
+
+    Attributes attributes =
+        converter.fromData(utf8("{\"k\":\"v\"}"), Attributes.class, Attributes.class);
+    assertTrue(attributes.fromCreator);
+    assertEquals(Collections.singletonMap("k", "v"), attributes.values);
   }
 
   public static class ConverterAndClass {
@@ -1445,6 +1867,10 @@ public class JacksonDataConverterTest {
     for (Function<ObjectMapper, ObjectMapper> interceptor : interceptors) {
       DataConverter custom = new JacksonDataConverter(interceptor);
 
+      ImmutableOrder order = newOrder("custom");
+      assertEquals(
+          order, custom.fromData(custom.toData(order), ImmutableOrder.class, ImmutableOrder.class));
+
       byte[] exception = custom.toData(new OrderFailedException("custom", 8, ORDER_DATE, null));
       Throwable result = custom.fromData(exception, Throwable.class, Throwable.class);
       assertEquals(OrderFailedException.class, result.getClass());
@@ -1458,5 +1884,52 @@ public class JacksonDataConverterTest {
 
       assertNull(custom.fromData(new byte[0], String.class, String.class));
     }
+  }
+
+  public static final class MaybeHolder {
+    final Optional<String> maybe;
+
+    @JsonCreator
+    MaybeHolder(@JsonProperty("maybe") Optional<String> maybe) {
+      this.maybe = maybe;
+    }
+  }
+
+  /** A JavaTimeModule or Jdk8Module that the application registers applies to its values. */
+  @Test
+  public void testApplicationJavaTimeAndJdk8ModulesApply() {
+    JavaTimeModule javaTime = new JavaTimeModule();
+    javaTime.addSerializer(
+        LocalDate.class,
+        new JsonSerializer<LocalDate>() {
+          @Override
+          public void serialize(LocalDate value, JsonGenerator gen, SerializerProvider provider)
+              throws IOException {
+            gen.writeString("CUSTOM-" + value);
+          }
+        });
+    javaTime.addSerializer(
+        Duration.class,
+        new JsonSerializer<Duration>() {
+          @Override
+          public void serialize(Duration value, JsonGenerator gen, SerializerProvider provider)
+              throws IOException {
+            gen.writeNumber(value.toMillis());
+          }
+        });
+    DataConverter custom =
+        new JacksonDataConverter(
+            mapper ->
+                mapper
+                    .registerModule(javaTime)
+                    .registerModule(new Jdk8Module().configureReadAbsentAsNull(true)));
+
+    assertEquals("\"CUSTOM-2025-04-15\"", asString(custom.toData(ORDER_DATE)));
+    assertEquals("90000", asString(custom.toData(Duration.ofSeconds(90))));
+    // A missing Optional is null rather than empty.
+    assertNull(custom.fromData(utf8("{}"), MaybeHolder.class, MaybeHolder.class).maybe);
+    assertEquals(
+        Optional.empty(),
+        converter.fromData(utf8("{}"), MaybeHolder.class, MaybeHolder.class).maybe);
   }
 }

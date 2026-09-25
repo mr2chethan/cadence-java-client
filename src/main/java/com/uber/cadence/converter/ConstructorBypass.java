@@ -29,7 +29,7 @@ import org.slf4j.LoggerFactory;
  * creates such instances without running their constructors too (Gson uses {@code
  * sun.misc.Unsafe}). Only a constructor of a superclass runs: {@code Throwable(String)} for
  * throwables, so that the message and the stack trace, cause and suppressed exceptions are properly
- * initialized. Other classes are not supported.
+ * initialized, and {@code Object()} for everything else.
  *
  * <p>Uses {@code sun.reflect.ReflectionFactory} (module jdk.unsupported, like {@code
  * sun.misc.Unsafe}), which is reached reflectively because a compile time reference to an internal
@@ -41,27 +41,31 @@ final class ConstructorBypass {
 
   private static final Object REFLECTION_FACTORY;
   private static final Method NEW_CONSTRUCTOR_FOR_SERIALIZATION;
+  private static final Constructor<Object> OBJECT_CONSTRUCTOR;
   private static final Constructor<Throwable> THROWABLE_CONSTRUCTOR;
 
   static {
     Object factory = null;
     Method newConstructor = null;
+    Constructor<Object> objectConstructor = null;
     Constructor<Throwable> throwableConstructor = null;
     try {
       Class<?> factoryClass = Class.forName("sun.reflect.ReflectionFactory");
       factory = factoryClass.getMethod("getReflectionFactory").invoke(null);
       newConstructor =
           factoryClass.getMethod("newConstructorForSerialization", Class.class, Constructor.class);
+      objectConstructor = Object.class.getConstructor();
       throwableConstructor = Throwable.class.getConstructor(String.class);
     } catch (Exception | LinkageError e) {
       log.warn(
-          "sun.reflect.ReflectionFactory is not available. Exceptions without a usable constructor "
+          "sun.reflect.ReflectionFactory is not available. Classes without a usable constructor "
               + "cannot be deserialized by JacksonDataConverter.",
           e);
       factory = null;
     }
     REFLECTION_FACTORY = factory;
     NEW_CONSTRUCTOR_FOR_SERIALIZATION = newConstructor;
+    OBJECT_CONSTRUCTOR = objectConstructor;
     THROWABLE_CONSTRUCTOR = throwableConstructor;
   }
 
@@ -75,10 +79,12 @@ final class ConstructorBypass {
           if (REFLECTION_FACTORY == null || Modifier.isAbstract(type.getModifiers())) {
             return null;
           }
+          Constructor<?> superConstructor =
+              Throwable.class.isAssignableFrom(type) ? THROWABLE_CONSTRUCTOR : OBJECT_CONSTRUCTOR;
           try {
             return (Constructor<?>)
                 NEW_CONSTRUCTOR_FOR_SERIALIZATION.invoke(
-                    REFLECTION_FACTORY, type, THROWABLE_CONSTRUCTOR);
+                    REFLECTION_FACTORY, type, superConstructor);
           } catch (Exception | LinkageError e) {
             log.debug("Cannot create a constructor bypassing ones of {}", type.getName(), e);
             return null;
@@ -92,7 +98,7 @@ final class ConstructorBypass {
    * Returns a constructor that creates an instance of {@code type} without running its
    * constructors, or null if that is not possible (interface, abstract class, or runtime without
    * {@code sun.reflect.ReflectionFactory}). For a throwable the constructor takes the message as
-   * its only argument; other types are not supported.
+   * its only argument; otherwise it takes no arguments.
    */
   static Constructor<?> constructorFor(Class<?> type) {
     return CONSTRUCTORS.get(type);
