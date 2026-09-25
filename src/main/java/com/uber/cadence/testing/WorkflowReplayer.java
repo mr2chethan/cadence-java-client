@@ -96,13 +96,25 @@ public final class WorkflowReplayer {
   public static void replayWorkflowExecution(
       WorkflowExecutionHistory history, Class<?> workflowClass, Class<?>... moreWorkflowClasses)
       throws Exception {
-    WorkflowExecutionStartedEventAttributes attr =
-        history.getEvents().get(0).getWorkflowExecutionStartedEventAttributes();
-    TaskList taskList = attr.getTaskList();
-    TestWorkflowEnvironment testEnv = TestWorkflowEnvironment.newInstance();
-    Worker worker = testEnv.newWorker(taskList.getName());
-    worker.registerWorkflowImplementationTypes(
-        ObjectArrays.concat(moreWorkflowClasses, workflowClass));
-    worker.replayWorkflowExecution(history);
+    replay(TestWorkflowEnvironment.newInstance(), history, workflowClass, moreWorkflowClasses);
+  }
+
+  private static void replay(
+      TestWorkflowEnvironment testEnv,
+      WorkflowExecutionHistory history,
+      Class<?> workflowClass,
+      Class<?>... moreWorkflowClasses)
+      throws Exception {
+    try {
+      WorkflowExecutionStartedEventAttributes attr =
+          history.getEvents().get(0).getWorkflowExecutionStartedEventAttributes();
+      TaskList taskList = attr.getTaskList();
+      Worker worker = testEnv.newWorker(taskList.getName());
+      worker.registerWorkflowImplementationTypes(
+          ObjectArrays.concat(moreWorkflowClasses, workflowClass));
+      worker.replayWorkflowExecution(history);
+    } finally {
+      testEnv.close();
+    }
   }
 }

@@ -2,6 +2,7 @@
 
 ## Unreleased
 - Add GetVersionOptions to Workflow.getVersion() for controlled version selection (executeWithVersion, executeWithMinVersion)
+- Fix WorkflowReplayer not closing the TestWorkflowEnvironment it creates for each replay
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)
