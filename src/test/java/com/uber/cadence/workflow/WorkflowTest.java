@@ -3585,7 +3585,7 @@ public class WorkflowTest {
         return null;
       }
 
-      lastCompletionResult = Workflow.getLastCompletionResult(String.class);
+      String result = Workflow.getLastCompletionResult(String.class);
 
       AtomicInteger count = retryCount.get(testName);
       if (count == null) {
@@ -3593,6 +3593,11 @@ public class WorkflowTest {
         retryCount.put(testName, count);
       }
       int c = count.incrementAndGet();
+      // Runs 3 and 4 both see run 2's result, as run 3 fails. Only they record it: a later run can
+      // start before the test's cancellation reaches the cron workflow, and sees run 4's result.
+      if (c == 3 || c == 4) {
+        lastCompletionResult = result;
+      }
 
       if (c == 3) {
         throw new RuntimeException("simulated error");
@@ -3609,6 +3614,7 @@ public class WorkflowTest {
   // Min interval in cron is 1min. So we will not test it against real service in CI.
   @RequiresTestService
   public void testWorkflowWithCronSchedule() {
+    lastCompletionResult = null;
     startWorkerFor(TestWorkflowWithCronScheduleImpl.class);
 
     WorkflowStub client =
@@ -3646,6 +3652,7 @@ public class WorkflowTest {
   // Min interval in cron is 1min. So we will not test it against real service in CI.
   @RequiresTestService
   public void testChildWorkflowWithCronSchedule() {
+    lastCompletionResult = null;
     startWorkerFor(TestCronParentWorkflow.class, TestWorkflowWithCronScheduleImpl.class);
 
     WorkflowStub client =
