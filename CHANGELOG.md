@@ -6,6 +6,7 @@
 - Add JacksonDataConverter, an opt-in Jackson based alternative to JsonDataConverter that supports java.time types, also on JDK 16 and later (#1094)
 - Fix JacksonDataConverter failing on the client's own records (getVersion, mutableSideEffect and local activity markers, retry options, shadowing heartbeats) and on empty payloads, and decoding a Set in hash order
 - Fix JacksonDataConverter losing the class, fields and message of exceptions
+- Fix JacksonDataConverter failing on classes without a no-arg constructor, and support Optional (adds the jackson-datatype-jdk8 dependency)
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)

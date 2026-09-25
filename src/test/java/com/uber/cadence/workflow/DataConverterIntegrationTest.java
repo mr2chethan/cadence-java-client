@@ -56,6 +56,11 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -144,6 +149,12 @@ public class DataConverterIntegrationTest {
     activities = new TestActivitiesImpl();
     testEnvironment = startEnvironment(converter, activities);
     client = testEnvironment.newWorkflowClient();
+  }
+
+  @Test
+  public void testLocalActivityReturningPojo() throws Exception {
+    assumeGsonCanConvert(Duration.ofSeconds(1));
+    assertEquals("42 USD", runScenario(Scenario.LOCAL_ACTIVITY));
   }
 
   @Test
@@ -265,6 +276,30 @@ public class DataConverterIntegrationTest {
   }
 
   @Test
+  public void testPojoWithoutNoArgConstructor() throws Exception {
+    MoneyWorkflow workflow = client.newWorkflowStub(MoneyWorkflow.class);
+    WorkflowClient.start(workflow::run, new Money(21, "USD"));
+    workflow.add(new Money(8, "USD"));
+    assertEquals(new Money(50, "USD"), resultOf(workflow, Money.class));
+    assertEquals(new Money(50, "USD"), workflow.current());
+  }
+
+  @Test
+  public void testOptionalFields() throws Exception {
+    assumeGsonCanConvert(Optional.of("value"));
+    OptionalValues values =
+        new OptionalValues(
+            Optional.of("text"),
+            Optional.empty(),
+            OptionalInt.of(1),
+            OptionalLong.empty(),
+            OptionalDouble.of(0.5));
+    OptionalWorkflow workflow = client.newWorkflowStub(OptionalWorkflow.class);
+    WorkflowClient.start(workflow::run, values);
+    assertEquals(values.next().next(), resultOf(workflow, OptionalValues.class));
+  }
+
+  @Test
   public void testExceptionTypedField() throws Exception {
     OutcomeWorkflow workflow = client.newWorkflowStub(OutcomeWorkflow.class);
     WorkflowClient.start(workflow::run);
@@ -298,6 +333,8 @@ public class DataConverterIntegrationTest {
         VoidWorkflowImpl.class,
         FailingWorkflowImpl.class,
         ItemsWorkflowImpl.class,
+        MoneyWorkflowImpl.class,
+        OptionalWorkflowImpl.class,
         OutcomeWorkflowImpl.class);
     worker.registerActivitiesImplementations(activitiesImpl);
     environment.start();
@@ -437,6 +474,103 @@ public class DataConverterIntegrationTest {
     }
   }
 
+  /** Has only an all-args constructor. */
+  public static final class Money {
+    private final long amount;
+    private final String currency;
+
+    public Money(long amount, String currency) {
+      this.amount = amount;
+      this.currency = currency;
+    }
+
+    Money plus(Money other) {
+      return new Money(amount + other.amount, currency);
+    }
+
+    Money times(long factor) {
+      return new Money(amount * factor, currency);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof Money)) {
+        return false;
+      }
+      Money money = (Money) o;
+      return amount == money.amount && Objects.equals(currency, money.currency);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(amount, currency);
+    }
+
+    @Override
+    public String toString() {
+      return amount + " " + currency;
+    }
+  }
+
+  public static final class OptionalValues {
+    private final Optional<String> text;
+    private final Optional<String> missing;
+    private final OptionalInt count;
+    private final OptionalLong total;
+    private final OptionalDouble ratio;
+
+    public OptionalValues(
+        Optional<String> text,
+        Optional<String> missing,
+        OptionalInt count,
+        OptionalLong total,
+        OptionalDouble ratio) {
+      this.text = text;
+      this.missing = missing;
+      this.count = count;
+      this.total = total;
+      this.ratio = ratio;
+    }
+
+    OptionalValues next() {
+      return new OptionalValues(
+          text.map(value -> value + "!"),
+          missing.map(value -> value + "!"),
+          count.isPresent() ? OptionalInt.of(count.getAsInt() + 1) : count,
+          total.isPresent() ? OptionalLong.of(total.getAsLong() + 1) : total,
+          ratio.isPresent() ? OptionalDouble.of(ratio.getAsDouble() * 2) : ratio);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof OptionalValues)) {
+        return false;
+      }
+      OptionalValues that = (OptionalValues) o;
+      return text.equals(that.text)
+          && missing.equals(that.missing)
+          && count.equals(that.count)
+          && total.equals(that.total)
+          && ratio.equals(that.ratio);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(text, missing, count, total, ratio);
+    }
+
+    @Override
+    public String toString() {
+      return Arrays.asList(text, missing, count, total, ratio).toString();
+    }
+  }
+
   public static final class Outcome {
     private final String status;
     private final CodeException error;
@@ -452,6 +586,8 @@ public class DataConverterIntegrationTest {
   }
 
   public interface TestActivities {
+    Money doubleAmount(Money amount);
+
     String failOnce();
 
     String failTwice();
@@ -462,6 +598,8 @@ public class DataConverterIntegrationTest {
 
     String tag(Item item);
 
+    OptionalValues next(OptionalValues values);
+
     Outcome outcome();
   }
 
@@ -469,6 +607,11 @@ public class DataConverterIntegrationTest {
     final AtomicInteger failOnceCalls = new AtomicInteger();
     final AtomicInteger failTwiceCalls = new AtomicInteger();
     final AtomicInteger rejectCalls = new AtomicInteger();
+
+    @Override
+    public Money doubleAmount(Money amount) {
+      return amount.times(2);
+    }
 
     @Override
     public String failOnce() {
@@ -503,12 +646,18 @@ public class DataConverterIntegrationTest {
     }
 
     @Override
+    public OptionalValues next(OptionalValues values) {
+      return values.next();
+    }
+
+    @Override
     public Outcome outcome() {
       return new Outcome("rejected", new CodeException("rejected", 42));
     }
   }
 
   public enum Scenario {
+    LOCAL_ACTIVITY,
     LOCAL_ACTIVITY_RETRY,
     VERSION,
     MUTABLE_SIDE_EFFECT,
@@ -537,6 +686,8 @@ public class DataConverterIntegrationTest {
     @Override
     public String run(Scenario scenario) {
       switch (scenario) {
+        case LOCAL_ACTIVITY:
+          return localActivities(null).doubleAmount(new Money(21, "USD")).toString();
         case LOCAL_ACTIVITY_RETRY:
           return localActivities(retryOptions(Duration.ofSeconds(30))).failOnce();
         case VERSION:
@@ -683,6 +834,58 @@ public class DataConverterIntegrationTest {
         results.add(item.getName() + " -> " + activities.tag(item));
       }
       return String.join(", ", results);
+    }
+  }
+
+  public interface MoneyWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    Money run(Money initial);
+
+    @SignalMethod
+    void add(Money amount);
+
+    @QueryMethod
+    Money current();
+  }
+
+  public static class MoneyWorkflowImpl implements MoneyWorkflow {
+    private Money current;
+    private Money added;
+
+    @Override
+    public Money run(Money initial) {
+      current = newActivityStub().doubleAmount(initial);
+      Workflow.await(() -> added != null);
+      current = current.plus(added);
+      return current;
+    }
+
+    @Override
+    public void add(Money amount) {
+      added = amount;
+    }
+
+    @Override
+    public Money current() {
+      return current;
+    }
+  }
+
+  public interface OptionalWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    OptionalValues run(OptionalValues values);
+  }
+
+  public static class OptionalWorkflowImpl implements OptionalWorkflow {
+    @Override
+    public OptionalValues run(OptionalValues values) {
+      return newActivityStub().next(values.next());
     }
   }
 

@@ -22,6 +22,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.Version;
 import com.fasterxml.jackson.databind.BeanDescription;
 import com.fasterxml.jackson.databind.DeserializationConfig;
 import com.fasterxml.jackson.databind.DeserializationContext;
@@ -31,16 +32,21 @@ import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.Module;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.SerializerProvider;
 import com.fasterxml.jackson.databind.deser.Deserializers;
+import com.fasterxml.jackson.databind.deser.ValueInstantiator;
+import com.fasterxml.jackson.databind.deser.ValueInstantiators;
 import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.google.common.base.Defaults;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.uber.cadence.client.ApplicationFailureException;
 import java.io.IOException;
@@ -53,9 +59,11 @@ import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.util.AbstractSet;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
@@ -93,6 +101,13 @@ import org.slf4j.LoggerFactory;
  * <p>Behavior to be aware of:
  *
  * <ul>
+ *   <li>A class that Jackson cannot instantiate, because it has no no-arg constructor, {@code
+ *       JsonCreator} or {@code ConstructorProperties} (for example an immutable class with only an
+ *       all-args constructor, a Lombok {@code @Value} class or a non-static inner class), is
+ *       instantiated without running its constructors and field initializers, and its fields are
+ *       set from the JSON; the enclosing instance of a non-static inner class is null. This is what
+ *       {@link JsonDataConverter} does too. JDK classes and their subclasses, collections, maps,
+ *       abstract types and throwables are excluded.
  *   <li>Exceptions are restored as their exact class with their exact message, stack trace, cause,
  *       suppressed exceptions and fields. Like {@link JsonDataConverter}, the no-arg constructor of
  *       the exception class is used when it has one. Otherwise, as with Java serialization, no
@@ -102,6 +117,7 @@ import org.slf4j.LoggerFactory;
  *   <li>An empty or whitespace-only payload is decoded as null (the first argument null and the
  *       remaining ones their default value), like {@link JsonDataConverter}.
  *   <li>An abstract {@link Set} is decoded as an insertion-ordered {@link LinkedHashSet}.
+ *   <li>{@link Optional} values are written as the contained value, or null when empty.
  *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
  *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
  * </ul>
@@ -188,8 +204,12 @@ public final class JacksonDataConverter implements DataConverter {
   private static ObjectMapper newDefaultObjectMapper() {
     ObjectMapper mapper = new ObjectMapper();
 
-    // Register Java 8 date/time module
-    mapper.registerModule(new JavaTimeModule());
+    // Java 8 date/time types, and Optional, OptionalInt, OptionalLong and OptionalDouble. They are
+    // registered under ids of their own, as Jackson ignores a module registered under an id it has
+    // already seen: a JavaTimeModule or Jdk8Module registered by the mapper interceptor then still
+    // applies.
+    mapper.registerModule(new ModuleWithId(JavaTimeModule.class.getName(), new JavaTimeModule()));
+    mapper.registerModule(new ModuleWithId(Jdk8Module.class.getName(), new Jdk8Module()));
 
     // Match Gson's behavior: serialize null fields
     mapper.setSerializationInclusion(JsonInclude.Include.ALWAYS);
@@ -758,7 +778,39 @@ public final class JacksonDataConverter implements DataConverter {
     @Override
     public void setupModule(SetupContext context) {
       super.setupModule(context);
+      context.addValueInstantiators(new ConstructorlessValueInstantiators());
       context.addDeserializers(new ThrowableDeserializers());
+    }
+  }
+
+  /** Registers a module under another id. */
+  private static final class ModuleWithId extends Module {
+    private final String id;
+    private final Module module;
+
+    ModuleWithId(String module, Module delegate) {
+      this.id = "com.uber.cadence.converter.JacksonDataConverter." + module;
+      this.module = delegate;
+    }
+
+    @Override
+    public String getModuleName() {
+      return module.getModuleName();
+    }
+
+    @Override
+    public Version version() {
+      return module.version();
+    }
+
+    @Override
+    public Object getTypeId() {
+      return id;
+    }
+
+    @Override
+    public void setupModule(SetupContext context) {
+      module.setupModule(context);
     }
   }
 
@@ -879,6 +931,107 @@ public final class JacksonDataConverter implements DataConverter {
     @Override
     public boolean isCachable() {
       return true;
+    }
+  }
+
+  /**
+   * Lets Jackson deserialize classes that have no creator it can use (no no-arg constructor, {@code
+   * JsonCreator} or {@code ConstructorProperties}), such as immutable classes with only an all-args
+   * constructor, Lombok {@code @Value} classes and non-static inner classes. Such classes are
+   * instantiated without running their constructors, as JsonDataConverter does, and their fields
+   * are then set from the JSON.
+   */
+  private static final class ConstructorlessValueInstantiators extends ValueInstantiators.Base {
+
+    private static final ImmutableList<String> JDK_PACKAGE_PREFIXES =
+        ImmutableList.of("java.", "javax.", "jdk.", "sun.", "com.sun.");
+
+    @Override
+    public ValueInstantiator findValueInstantiator(
+        DeserializationConfig config,
+        BeanDescription beanDesc,
+        ValueInstantiator defaultInstantiator) {
+      Class<?> type = beanDesc.getBeanClass();
+      if (hasCreator(defaultInstantiator) || !isEligible(type)) {
+        return defaultInstantiator;
+      }
+      Constructor<?> constructor = ConstructorBypass.constructorFor(type);
+      if (constructor == null) {
+        return defaultInstantiator;
+      }
+      return new ConstructorlessValueInstantiator(defaultInstantiator, constructor);
+    }
+
+    private static boolean hasCreator(ValueInstantiator instantiator) {
+      return instantiator.canCreateUsingDefault()
+          || instantiator.canCreateFromObjectWith()
+          || instantiator.canCreateUsingDelegate()
+          || instantiator.canCreateUsingArrayDelegate();
+    }
+
+    // Arrays, primitive types and enums do not get here, nor do throwables, which
+    // ThrowableDeserializers handles. Collections and maps do.
+    private static boolean isEligible(Class<?> type) {
+      // Collections and maps keep their elements in fields that their constructors initialize.
+      if (Modifier.isAbstract(type.getModifiers())
+          || Collection.class.isAssignableFrom(type)
+          || Map.class.isAssignableFrom(type)) {
+        return false;
+      }
+      // JDK classes, their subclasses and records keep Jackson's own handling.
+      for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+        if (isJdkClass(c)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    private static boolean isJdkClass(Class<?> type) {
+      for (String prefix : JDK_PACKAGE_PREFIXES) {
+        if (type.getName().startsWith(prefix)) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  private static final class ConstructorlessValueInstantiator extends ValueInstantiator.Delegating {
+
+    private final Constructor<?> constructor;
+
+    ConstructorlessValueInstantiator(ValueInstantiator delegate, Constructor<?> constructor) {
+      super(delegate);
+      this.constructor = constructor;
+    }
+
+    @Override
+    public ValueInstantiator createContextual(DeserializationContext ctxt, BeanDescription beanDesc)
+        throws JsonMappingException {
+      ValueInstantiator contextual = delegate().createContextual(ctxt, beanDesc);
+      return contextual == delegate()
+          ? this
+          : new ConstructorlessValueInstantiator(contextual, constructor);
+    }
+
+    @Override
+    public boolean canInstantiate() {
+      return true;
+    }
+
+    @Override
+    public boolean canCreateUsingDefault() {
+      return true;
+    }
+
+    @Override
+    public Object createUsingDefault(DeserializationContext ctxt) throws IOException {
+      try {
+        return constructor.newInstance();
+      } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+        return ctxt.handleInstantiationProblem(constructor.getDeclaringClass(), null, e);
+      }
     }
   }
 }
