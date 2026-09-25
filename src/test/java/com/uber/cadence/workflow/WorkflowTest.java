@@ -24,10 +24,12 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
+import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.uber.cadence.ActiveClusterSelectionPolicy;
@@ -60,6 +62,8 @@ import com.uber.cadence.client.*;
 import com.uber.cadence.common.CronSchedule;
 import com.uber.cadence.common.MethodRetry;
 import com.uber.cadence.common.RetryOptions;
+import com.uber.cadence.converter.DataConverter;
+import com.uber.cadence.converter.JacksonDataConverter;
 import com.uber.cadence.converter.JsonDataConverter;
 import com.uber.cadence.internal.common.WorkflowExecutionUtils;
 import com.uber.cadence.internal.sync.DeterministicRunnerTest;
@@ -111,7 +115,10 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.RuleChain;
 import org.junit.rules.TestName;
+import org.junit.rules.TestRule;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
@@ -128,35 +135,70 @@ public class WorkflowTest {
       "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
   private static final boolean stickyOff = Boolean.parseBoolean(System.getenv("STICKY_OFF"));
 
-  @Rule public final CadenceTestRule cadenceTestRule;
+  public final CadenceTestRule cadenceTestRule;
+  // Applies cadenceTestRule around the converter timeout, so that the test environment of a test
+  // that timed out is still shut down.
+  @Rule public final RuleChain rules;
   @Rule public final TestName testName = new TestName();
 
   @Parameters(name = "{0}")
   public static Object[] data() {
     if (TestEnvironment.isUseDockerService()) {
       return new Object[][] {
-        {"Docker Sticky " + (stickyOff ? "OFF" : "ON"), stickyOff},
+        {"Docker Sticky " + (stickyOff ? "OFF" : "ON"), stickyOff, JsonDataConverter.getInstance()},
       };
     } else {
-      return new Object[][] {{"TestService Sticky OFF", true}, {"TestService Sticky ON", false}};
+      List<Object[]> rows = new ArrayList<>();
+      if (isConverterEnabled("gson")) {
+        DataConverter gson = JsonDataConverter.getInstance();
+        rows.add(new Object[] {"TestService Sticky OFF", true, gson});
+        rows.add(new Object[] {"TestService Sticky ON", false, gson});
+      }
+      if (isConverterEnabled("jackson")) {
+        DataConverter jackson = JacksonDataConverter.getInstance();
+        rows.add(new Object[] {"TestService Sticky OFF Jackson", true, jackson});
+        rows.add(new Object[] {"TestService Sticky ON Jackson", false, jackson});
+      }
+      return rows.toArray();
     }
   }
 
+  /**
+   * Whether the in-memory tests run with the named converter ("gson" or "jackson"). The system
+   * property cadence.test.converters restricts them to a comma separated list of converters.
+   */
+  private static boolean isConverterEnabled(String name) {
+    String converters = System.getProperty("cadence.test.converters", "gson,jackson");
+    return Splitter.on(',').trimResults().splitToList(converters).contains(name);
+  }
+
   private final boolean disableStickyExecution;
+  private final DataConverter dataConverter;
   private String taskList;
   private TestActivitiesImpl activitiesImpl;
   private WorkflowClient workflowClient;
   private TracingWorkflowInterceptorFactory tracer;
 
-  public WorkflowTest(String ignored, boolean disableStickyExecution) {
+  public WorkflowTest(String ignored, boolean disableStickyExecution, DataConverter dataConverter) {
     this.disableStickyExecution = disableStickyExecution;
+    this.dataConverter = dataConverter;
     this.cadenceTestRule =
         CadenceTestRule.builder()
+            .withClientOptions(
+                WorkflowClientOptions.newBuilder().setDataConverter(dataConverter).build())
             .withWorkerFactoryOptions(
                 WorkerFactoryOptions.newBuilder()
                     .setDisableStickyExecution(disableStickyExecution)
                     .build())
             .build();
+    // CadenceTestRule sets no timeout for most tests, and many of them wait for a workflow result
+    // without a deadline. A converter that cannot decode the payloads the client encodes for itself
+    // (markers, versions, retry options) makes them wait forever, so the Jackson rows get one.
+    TestRule converterTimeout =
+        dataConverter instanceof JacksonDataConverter
+            ? Timeout.seconds(120)
+            : (base, description) -> base;
+    this.rules = RuleChain.outerRule(cadenceTestRule).around(converterTimeout);
   }
 
   private static WorkflowOptions.Builder newWorkflowOptionsBuilder(String taskList) {
@@ -219,6 +261,8 @@ public class WorkflowTest {
     }
 
     workflowClient = cadenceTestRule.getWorkflowClient();
+    // The client of the test uses the converter of the row, not only its workers.
+    assertSame(dataConverter, workflowClient.getOptions().getDataConverter());
     tracer = cadenceTestRule.getTracer();
     ActivityCompletionClient completionClient = workflowClient.newActivityCompletionClient();
     activitiesImpl = new TestActivitiesImpl(completionClient);
@@ -3024,6 +3068,7 @@ public class WorkflowTest {
                   }
                 })
             .setDomain(DOMAIN)
+            .setDataConverter(dataConverter)
             .build();
     WorkflowClient wc = cadenceTestRule.createWorkflowClient(clientOptions);
 
