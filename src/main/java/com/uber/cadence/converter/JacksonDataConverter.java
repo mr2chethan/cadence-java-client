@@ -133,7 +133,8 @@ import org.slf4j.LoggerFactory;
  *       where {@link JsonDataConverter} always gives Double. Register {@link
  *       #gsonCompatibleNumbersModule()} for Double.
  *   <li>Jackson annotations on the classes of payloads apply, for example {@code @JsonIgnore},
- *       {@code @JsonProperty} or {@code @JsonTypeInfo}.
+ *       {@code @JsonProperty} or {@code @JsonTypeInfo}. The first time one of them makes the JSON
+ *       of a class differ from the JSON of {@link JsonDataConverter}, that is logged at INFO.
  * </ul>
  *
  * <p>Gson annotations and types: like {@link JsonDataConverter}, it applies Gson's {@code
@@ -141,7 +142,11 @@ import org.slf4j.LoggerFactory;
  * enum constants), and it writes and reads Gson's JsonElement, JsonObject, JsonArray and
  * JsonPrimitive as the JSON they represent. A non-empty name of a Jackson {@code JsonProperty}
  * takes precedence over the name of {@code SerializedName}, which is then still read. Gson's {@code
- * JsonAdapter} is not supported.
+ * JsonAdapter} is not supported. A property of a payload that the class of the value has no field
+ * for is skipped, and logged at WARN once per class and property; {@code @JsonIgnoreProperties} on
+ * the class silences it. Unknown properties of exceptions are skipped without a message, as in
+ * {@link JsonDataConverter}. These messages use the logger {@code
+ * com.uber.cadence.converter.JacksonDataConverter.GsonCompatibility}.
  *
  * <p>Migrating from {@link JsonDataConverter}:
  *
@@ -236,7 +241,7 @@ public final class JacksonDataConverter implements DataConverter {
    * Writes and reads the data that the client records for itself (see {@link ClientPayloads}), so
    * that no customization of the ObjectMapper can change or break it. Never exposed.
    */
-  private static final ObjectMapper CLIENT_PAYLOAD_MAPPER = newDefaultObjectMapper();
+  private static final ObjectMapper CLIENT_PAYLOAD_MAPPER = newDefaultObjectMapper(false);
 
   /** Holds the singleton, so that it is created after all static fields of this class. */
   private static final class InstanceHolder {
@@ -291,7 +296,7 @@ public final class JacksonDataConverter implements DataConverter {
    *     ObjectMapper
    */
   public JacksonDataConverter(Function<ObjectMapper, ObjectMapper> mapperInterceptor) {
-    ObjectMapper configured = mapperInterceptor.apply(newDefaultObjectMapper());
+    ObjectMapper configured = mapperInterceptor.apply(newDefaultObjectMapper(true));
     if (configured == null || !configured.getRegisteredModuleIds().contains(CadenceModule.ID)) {
       throw new IllegalArgumentException(
           "mapperInterceptor must return the ObjectMapper it was given, or a copy() of it, after"
@@ -344,7 +349,11 @@ public final class JacksonDataConverter implements DataConverter {
     return ClientPayloads.isClientPayload(raw) ? CLIENT_PAYLOAD_MAPPER : objectMapper;
   }
 
-  private static ObjectMapper newDefaultObjectMapper() {
+  /**
+   * @param withDiagnostics whether to log differences from JsonDataConverter, which is not done for
+   *     the data the client records for itself
+   */
+  private static ObjectMapper newDefaultObjectMapper(boolean withDiagnostics) {
     ObjectMapper mapper = new ObjectMapper();
 
     // Java 8 date/time types, and Optional, OptionalInt, OptionalLong and OptionalDouble. They are
@@ -376,7 +385,7 @@ public final class JacksonDataConverter implements DataConverter {
     mapper.setVisibility(PropertyAccessor.SETTER, JsonAutoDetect.Visibility.NONE);
 
     // Registered after JavaTimeModule, so that its Duration deserializer takes precedence.
-    mapper.registerModule(new CadenceModule(mapper));
+    mapper.registerModule(new CadenceModule(mapper, withDiagnostics));
 
     return mapper;
   }
@@ -941,8 +950,11 @@ public final class JacksonDataConverter implements DataConverter {
     /** A unique id: Jackson ignores a module registered under an id it has already seen. */
     static final String ID = "com.uber.cadence.converter.JacksonDataConverter.CadenceModule";
 
-    CadenceModule(ObjectMapper mapper) {
+    private final boolean withDiagnostics;
+
+    CadenceModule(ObjectMapper mapper, boolean withDiagnostics) {
       super(ID);
+      this.withDiagnostics = withDiagnostics;
       addSerializer(DataConverter.class, new DataConverterSerializer());
       addDeserializer(DataConverter.class, new DataConverterDeserializer());
       addSerializer(Class.class, new ClassSerializer());
@@ -980,6 +992,12 @@ public final class JacksonDataConverter implements DataConverter {
       context.addBeanDeserializerModifier(new GsonCompatibility.ReadModifier());
       context.addBeanDeserializerModifier(new GsonCompatibility.InternalPayloadReadModifier());
       context.addBeanSerializerModifier(new GsonCompatibility.InternalPayloadWriteModifier());
+      if (withDiagnostics) {
+        context.addDeserializationProblemHandler(
+            new GsonCompatibilityDiagnostics.UnknownProperties());
+        context.addBeanSerializerModifier(new GsonCompatibilityDiagnostics.Writing());
+        context.addBeanDeserializerModifier(new GsonCompatibilityDiagnostics.Reading());
+      }
     }
   }
 

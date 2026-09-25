@@ -30,15 +30,22 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonAnySetter;
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonValue;
+import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.core.Version;
 import com.fasterxml.jackson.core.json.JsonReadFeature;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.introspect.AnnotationIntrospectorPair;
 import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
@@ -51,13 +58,20 @@ import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonPrimitive;
+import com.google.gson.TypeAdapter;
+import com.google.gson.annotations.JsonAdapter;
 import com.google.gson.annotations.SerializedName;
 import com.google.gson.reflect.TypeToken;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonWriter;
+import com.uber.cadence.common.RetryOptions;
+import com.uber.cadence.internal.shadowing.ScanWorkflowActivityParams;
 import java.io.IOException;
 import java.lang.reflect.Type;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -68,12 +82,16 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 /**
  * JacksonDataConverter applies Gson's annotations and writes Gson's tree types like
- * JsonDataConverter.
+ * JsonDataConverter, and logs where it gives other results than JsonDataConverter.
+ *
+ * <p>The log messages are logged once per JVM, so each test that checks them uses classes that no
+ * other test uses.
  */
 public class JacksonDataConverterGsonAnnotationsTest {
 
@@ -985,6 +1003,470 @@ public class JacksonDataConverterGsonAnnotationsTest {
     return given.get();
   }
 
+  // ---------- Diagnostics ----------
+
+  private static List<DataConverter> threeConverters() {
+    return Arrays.asList(
+        JacksonDataConverter.getInstance(),
+        new JacksonDataConverter(Function.identity()),
+        new JacksonDataConverter(ObjectMapper::copy));
+  }
+
+  public static class UnknownPropertyTarget {
+    String kept;
+  }
+
+  public static class UnknownPropertyCreatorTarget {
+    final String kept;
+
+    @JsonCreator
+    UnknownPropertyCreatorTarget(@JsonProperty("kept") String kept) {
+      this.kept = kept;
+    }
+  }
+
+  @Test
+  public void unknownPropertyLoggedOncePerClassAndProperty() {
+    try (LogCapture log = LogCapture.diagnostics()) {
+      for (DataConverter converter : threeConverters()) {
+        for (int i = 0; i < 2; i++) {
+          assertEquals(
+              "k",
+              read(converter, "{\"kept\":\"k\",\"dropped\":1}", UnknownPropertyTarget.class).kept);
+          Object[] single =
+              converter.fromDataArray(
+                  utf8("{\"kept\":\"k\",\"dropped\":2}"), UnknownPropertyTarget.class);
+          assertEquals("k", ((UnknownPropertyTarget) single[0]).kept);
+          Object[] several =
+              converter.fromDataArray(
+                  utf8("[{\"kept\":\"k\",\"dropped\":3,\"other\":[1]},4]"),
+                  UnknownPropertyTarget.class,
+                  int.class);
+          assertEquals("k", ((UnknownPropertyTarget) several[0]).kept);
+          assertEquals(4, several[1]);
+          assertEquals(
+              "c",
+              read(converter, "{\"kept\":\"c\",\"dropped\":1}", UnknownPropertyCreatorTarget.class)
+                  .kept);
+        }
+      }
+
+      List<String> warnings = log.messages(Level.WARN, readAs(UnknownPropertyTarget.class));
+      assertEquals(warnings.toString(), 2, warnings.size());
+      assertTrue(warnings.get(0), warnings.get(0).contains("\"dropped\""));
+      assertTrue(warnings.get(1), warnings.get(1).contains("\"other\""));
+      List<String> creatorWarnings =
+          log.messages(Level.WARN, readAs(UnknownPropertyCreatorTarget.class));
+      assertEquals(creatorWarnings.toString(), 1, creatorWarnings.size());
+      assertTrue(creatorWarnings.get(0).contains("\"dropped\""));
+    }
+  }
+
+  @JsonIgnoreProperties(ignoreUnknown = true)
+  public static class IgnoresUnknownTarget {
+    String kept;
+  }
+
+  @JsonIgnoreProperties({"dropped"})
+  public static class IgnoresNamedTarget {
+    String kept;
+  }
+
+  @Test
+  public void notLoggedWithJsonIgnoreProperties() {
+    try (LogCapture log = LogCapture.diagnostics()) {
+      for (DataConverter converter : threeConverters()) {
+        assertEquals(
+            "k",
+            read(
+                    converter,
+                    "{\"kept\":\"k\",\"dropped\":1,\"other\":2}",
+                    IgnoresUnknownTarget.class)
+                .kept);
+        assertEquals(
+            "k", read(converter, "{\"kept\":\"k\",\"dropped\":1}", IgnoresNamedTarget.class).kept);
+      }
+      assertEquals(
+          Collections.emptyList(), log.messages(Level.WARN, IgnoresUnknownTarget.class.getName()));
+      assertEquals(
+          Collections.emptyList(), log.messages(Level.WARN, IgnoresNamedTarget.class.getName()));
+    }
+  }
+
+  public static class ClearedHandlersTarget {
+    String kept;
+  }
+
+  @Test
+  public void notLoggedAfterClearProblemHandlers() {
+    DataConverter quiet = new JacksonDataConverter(ObjectMapper::clearProblemHandlers);
+    String json = "{\"kept\":\"k\",\"dropped\":1}";
+    try (LogCapture log = LogCapture.diagnostics()) {
+      assertEquals("k", read(quiet, json, ClearedHandlersTarget.class).kept);
+      assertEquals(
+          Collections.emptyList(), log.messages(Level.WARN, ClearedHandlersTarget.class.getName()));
+
+      // Logged by a converter that keeps them.
+      assertEquals("k", read(JACKSON, json, ClearedHandlersTarget.class).kept);
+      assertEquals(1, log.messages(Level.WARN, readAs(ClearedHandlersTarget.class)).size());
+    }
+  }
+
+  public static class ClientPayloadContrast {
+    String kept;
+  }
+
+  /** The data that the client records for itself, such as what the Go client wrote. */
+  @Test
+  public void notLoggedForClientPayloads() {
+    String extra = "extraPropertyOfGoClient";
+    RetryOptions options =
+        new RetryOptions.Builder()
+            .setInitialInterval(Duration.ofSeconds(2))
+            .setMaximumAttempts(3)
+            .build();
+    JsonObject optionsJson = tree(JACKSON.toData(options)).getAsJsonObject();
+    optionsJson.addProperty(extra, 1);
+    try (LogCapture log = LogCapture.diagnostics()) {
+      for (DataConverter converter : threeConverters()) {
+        RetryOptions readOptions =
+            converter.fromData(
+                utf8(optionsJson.toString()), RetryOptions.class, RetryOptions.class);
+        assertEquals(Duration.ofSeconds(2), readOptions.getInitialInterval());
+        assertEquals(3, readOptions.getMaximumAttempts());
+
+        ScanWorkflowActivityParams params =
+            read(
+                converter,
+                "{\"domain\":\"d\",\"workflowQuery\":\"q\",\"samplingRate\":0.5,\"pageSize\":10,"
+                    + "\""
+                    + extra
+                    + "\":1}",
+                ScanWorkflowActivityParams.class);
+        assertEquals("d", params.getDomain());
+        assertEquals(10, params.getPageSize());
+
+        // Also with other values, which the configured mapper reads.
+        Object[] several =
+            converter.fromDataArray(utf8("[" + optionsJson + ",1]"), RetryOptions.class, int.class);
+        assertEquals(Duration.ofSeconds(2), ((RetryOptions) several[0]).getInitialInterval());
+        assertEquals(1, several[1]);
+      }
+      assertEquals(Collections.emptyList(), log.messages(Level.WARN, extra));
+
+      // Logged for the values of the application.
+      read(JACKSON, "{\"kept\":\"k\",\"" + extra + "\":1}", ClientPayloadContrast.class);
+      List<String> warnings = log.messages(Level.WARN, extra);
+      assertEquals(warnings.toString(), 1, warnings.size());
+      assertTrue(warnings.get(0).contains(readAs(ClientPayloadContrast.class)));
+    }
+  }
+
+  public static class StrictTarget {
+    String kept;
+  }
+
+  /** Reading fails then, with the name of the property. */
+  @Test
+  public void notLoggedWhenUnknownPropertiesFail() {
+    DataConverter strict =
+        new JacksonDataConverter(
+            mapper -> mapper.enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES));
+    String json = "{\"kept\":\"k\",\"dropped\":1}";
+    try (LogCapture log = LogCapture.diagnostics()) {
+      DataConverterException e =
+          assertThrows(DataConverterException.class, () -> read(strict, json, StrictTarget.class));
+      assertTrue(e.getCause().getMessage(), e.getCause().getMessage().contains("\"dropped\""));
+      assertEquals(Collections.emptyList(), log.messages(Level.WARN, StrictTarget.class.getName()));
+
+      // Logged by a converter that skips it.
+      assertEquals("k", read(JACKSON, json, StrictTarget.class).kept);
+      assertEquals(1, log.messages(Level.WARN, readAs(StrictTarget.class)).size());
+    }
+  }
+
+  public static class WrittenDifferently {
+    String plain;
+
+    @JsonIgnore String ignored;
+
+    @JsonProperty("jackson_name")
+    String renamed;
+
+    @SerializedName("gson_name")
+    @JsonProperty("jackson_other")
+    String both;
+
+    @SerializedName("same")
+    String same;
+  }
+
+  public static class ReadDifferently {
+    String plain;
+
+    @JsonIgnore String ignored;
+
+    @JsonProperty("jackson_name")
+    String renamed;
+
+    @SerializedName("gson_name")
+    @JsonProperty("jackson_other")
+    String both;
+
+    @JsonProperty(access = JsonProperty.Access.READ_ONLY)
+    String readOnly;
+  }
+
+  public static class CreatorReadDifferently {
+    final String kept;
+
+    @JsonIgnore String ignored;
+
+    @JsonCreator
+    CreatorReadDifferently(@JsonProperty("kept") String kept) {
+      this.kept = kept;
+    }
+  }
+
+  public static class AnySetterReadDifferently {
+    @JsonIgnore String ignored;
+
+    final Map<String, Object> rest = new LinkedHashMap<>();
+
+    @JsonAnySetter
+    void set(String name, Object value) {
+      rest.put(name, value);
+    }
+  }
+
+  public static class NotDifferent {
+    String plain;
+
+    @SerializedName("gson")
+    String renamed;
+  }
+
+  @Test
+  public void annotationDifferenceLoggedOnceAtInfo() {
+    WrittenDifferently written = new WrittenDifferently();
+    written.plain = "p";
+    written.ignored = "i";
+    written.renamed = "r";
+    written.both = "b";
+    written.same = "s";
+    NotDifferent notDifferent = new NotDifferent();
+    notDifferent.plain = "p";
+    notDifferent.renamed = "r";
+    String readJson =
+        "{\"plain\":\"p\",\"ignored\":\"i\",\"renamed\":\"r\",\"gson_name\":\"b\","
+            + "\"readOnly\":\"o\",\"kept\":\"k\"}";
+
+    try (LogCapture log = LogCapture.diagnostics()) {
+      for (DataConverter converter : threeConverters()) {
+        for (int i = 0; i < 2; i++) {
+          assertEquals(
+              tree(
+                  "{\"plain\":\"p\",\"jackson_name\":\"r\",\"jackson_other\":\"b\",\"same\":\"s\"}"),
+              tree(converter.toData(written)));
+          ReadDifferently read = read(converter, readJson, ReadDifferently.class);
+          assertEquals("p", read.plain);
+          assertEquals("b", read.both);
+          assertNull(read.ignored);
+          assertNull(read.renamed);
+          assertNull(read.readOnly);
+          assertEquals("k", read(converter, readJson, CreatorReadDifferently.class).kept);
+          assertEquals(
+              "r", read(converter, readJson, AnySetterReadDifferently.class).rest.get("renamed"));
+          byte[] data = converter.toData(notDifferent);
+          assertEquals(
+              "r", converter.fromData(data, NotDifferent.class, NotDifferent.class).renamed);
+        }
+      }
+
+      List<String> writing =
+          log.messages(Level.INFO, "writes " + WrittenDifferently.class.getName() + " ");
+      assertEquals(writing.toString(), 1, writing.size());
+      assertTrue(writing.get(0), writing.get(0).contains("Not written: [ignored]"));
+      assertTrue(
+          writing.get(0),
+          writing.get(0).contains("renamed as \"jackson_name\" (JsonDataConverter: \"renamed\")"));
+      assertTrue(
+          writing.get(0),
+          writing.get(0).contains("both as \"jackson_other\" (JsonDataConverter: \"gson_name\")"));
+      assertFalse(writing.get(0), writing.get(0).contains("same"));
+
+      List<String> reading =
+          log.messages(Level.INFO, "of " + ReadDifferently.class.getName() + " ");
+      assertEquals(reading.toString(), 1, reading.size());
+      for (String notRead :
+          Arrays.asList(
+              "ignored (\"ignored\")", "renamed (\"renamed\")", "readOnly (\"readOnly\")")) {
+        assertTrue(reading.get(0), reading.get(0).contains(notRead));
+      }
+      assertFalse(reading.get(0), reading.get(0).contains("both"));
+      assertFalse(reading.get(0), reading.get(0).contains("plain"));
+
+      List<String> creator =
+          log.messages(Level.INFO, "of " + CreatorReadDifferently.class.getName() + " ");
+      assertEquals(creator.toString(), 1, creator.size());
+      assertTrue(creator.get(0), creator.get(0).contains("[ignored (\"ignored\")]"));
+
+      assertEquals(
+          Collections.emptyList(),
+          log.messages(Level.INFO, AnySetterReadDifferently.class.getName()));
+      assertEquals(Collections.emptyList(), log.messages(Level.INFO, NotDifferent.class.getName()));
+      assertEquals(Collections.emptyList(), log.messages(Level.WARN, NotDifferent.class.getName()));
+    }
+  }
+
+  public static class WrittenThroughGetters {
+    private final String customerId = "c";
+    private final int count = 2;
+
+    public String getCustomerId() {
+      return customerId;
+    }
+
+    public int getCount() {
+      return count;
+    }
+  }
+
+  public static class NamedByStrategy {
+    String someField = "x";
+  }
+
+  /**
+   * Properties written through getters are matched to their fields, and differences that the
+   * configuration of the mapper makes are reported, whichever mapper writes the class first. The
+   * data of the client in values of the application is not reported.
+   */
+  @Test
+  public void differencesOfTheMapperConfigurationAreReported() {
+    DataConverter getters =
+        new JacksonDataConverter(
+            mapper ->
+                mapper
+                    .setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.NONE)
+                    .setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.PUBLIC_ONLY));
+    DataConverter snakeCase =
+        new JacksonDataConverter(
+            mapper -> mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE));
+    try (LogCapture log = LogCapture.diagnostics()) {
+      assertEquals(
+          tree("{\"customerId\":\"c\",\"count\":2}"),
+          tree(getters.toData(new WrittenThroughGetters())));
+      assertEquals(
+          Collections.emptyList(), log.messages(Level.INFO, WrittenThroughGetters.class.getName()));
+
+      assertEquals("{\"someField\":\"x\"}", text(JACKSON.toData(new NamedByStrategy())));
+      assertEquals("{\"some_field\":\"x\"}", text(snakeCase.toData(new NamedByStrategy())));
+      List<String> writing =
+          log.messages(Level.INFO, "writes " + NamedByStrategy.class.getName() + " ");
+      assertEquals(writing.toString(), 1, writing.size());
+      assertTrue(
+          writing.get(0),
+          writing
+              .get(0)
+              .contains("someField as \"some_field\" (JsonDataConverter: \"someField\")"));
+      assertTrue(writing.get(0), writing.get(0).contains("ObjectMapper configuration"));
+
+      RetryOptions options =
+          new RetryOptions.Builder()
+              .setInitialInterval(Duration.ofSeconds(2))
+              .setMaximumAttempts(3)
+              .build();
+      Object[] decoded =
+          snakeCase.fromDataArray(snakeCase.toData(options, "x"), RetryOptions.class, String.class);
+      assertEquals(Duration.ofSeconds(2), ((RetryOptions) decoded[0]).getInitialInterval());
+      assertEquals(Collections.emptyList(), log.messages(Level.INFO, RetryOptions.class.getName()));
+    }
+  }
+
+  /** Its synthetic reference to the enclosing instance is not a field that Gson writes. */
+  @SuppressWarnings("ClassCanBeStatic")
+  public class InnerPayload {
+    @SerializedName("inner_name")
+    String name;
+  }
+
+  @Test
+  public void syntheticFieldsAreNotReportedAsDifferences() {
+    InnerPayload payload = new InnerPayload();
+    payload.name = "n";
+    try (LogCapture log = LogCapture.diagnostics()) {
+      byte[] data = JACKSON.toData(payload);
+      assertEquals("{\"inner_name\":\"n\"}", text(data));
+      assertEquals(text(GSON.toData(payload)), text(data));
+      assertEquals("n", JACKSON.fromData(data, InnerPayload.class, InnerPayload.class).name);
+      assertEquals(Collections.emptyList(), log.messages(Level.INFO, InnerPayload.class.getName()));
+    }
+  }
+
+  /** Writes a String in upper case. */
+  static final class UpperCaseAdapter extends TypeAdapter<String> {
+    @Override
+    public void write(JsonWriter out, String value) throws IOException {
+      out.value(value.toUpperCase(Locale.ROOT));
+    }
+
+    @Override
+    public String read(JsonReader in) throws IOException {
+      return in.nextString();
+    }
+  }
+
+  /** Writes an amount as its number of cents. */
+  static final class CentsAdapter extends TypeAdapter<AdaptedMoney> {
+    @Override
+    public void write(JsonWriter out, AdaptedMoney value) throws IOException {
+      out.value(value.cents);
+    }
+
+    @Override
+    public AdaptedMoney read(JsonReader in) throws IOException {
+      AdaptedMoney money = new AdaptedMoney();
+      money.cents = in.nextLong();
+      return money;
+    }
+  }
+
+  @JsonAdapter(CentsAdapter.class)
+  public static class AdaptedMoney {
+    long cents;
+  }
+
+  public static class AdaptedOrder {
+    @JsonAdapter(UpperCaseAdapter.class)
+    String code;
+
+    AdaptedMoney price;
+  }
+
+  @Test
+  public void jsonAdapterWarned() {
+    AdaptedOrder order = new AdaptedOrder();
+    order.code = "abc";
+    order.price = new AdaptedMoney();
+    order.price.cents = 123;
+    assertEquals(tree("{\"code\":\"ABC\",\"price\":123}"), tree(GSON.toData(order)));
+
+    try (LogCapture log = LogCapture.diagnostics()) {
+      for (DataConverter converter : threeConverters()) {
+        assertEquals(
+            tree("{\"code\":\"abc\",\"price\":{\"cents\":123}}"), tree(converter.toData(order)));
+      }
+      List<String> orderWarnings =
+          log.messages(Level.WARN, "of " + AdaptedOrder.class.getName() + " on ");
+      assertEquals(orderWarnings.toString(), 1, orderWarnings.size());
+      assertTrue(orderWarnings.get(0), orderWarnings.get(0).contains("[code]"));
+      List<String> moneyWarnings =
+          log.messages(Level.WARN, "of " + AdaptedMoney.class.getName() + " on ");
+      assertEquals(moneyWarnings.toString(), 1, moneyWarnings.size());
+      assertTrue(moneyWarnings.get(0), moneyWarnings.get(0).contains("[AdaptedMoney]"));
+    }
+  }
+
   // ---------- Helpers ----------
 
   private static byte[] utf8(String json) {
@@ -1012,6 +1494,11 @@ public class JacksonDataConverterGsonAnnotationsTest {
     return converter.fromData(utf8(json), type, type);
   }
 
+  /** The text that identifies the class in the message about a skipped property. */
+  private static String readAs(Class<?> type) {
+    return "read as " + type.getName() + ",";
+  }
+
   /** Collects what a logger logs while it is open. */
   private static final class LogCapture implements AutoCloseable {
     private final Logger logger;
@@ -1024,6 +1511,10 @@ public class JacksonDataConverterGsonAnnotationsTest {
       logger.setLevel(Level.INFO);
       appender.start();
       logger.addAppender(appender);
+    }
+
+    static LogCapture diagnostics() {
+      return new LogCapture(JacksonDataConverter.class.getName() + ".GsonCompatibility");
     }
 
     /** The messages of this logger with the given level that contain the text. */

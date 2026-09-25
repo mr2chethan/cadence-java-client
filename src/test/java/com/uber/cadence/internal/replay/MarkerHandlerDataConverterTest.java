@@ -17,6 +17,7 @@
 
 package com.uber.cadence.internal.replay;
 
+import static com.uber.cadence.converter.JacksonDataConverterTest.compatibilityLogOf;
 import static com.uber.cadence.converter.JacksonDataConverterTest.newCustomizedConverter;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -42,6 +43,7 @@ import com.uber.cadence.converter.JsonDataConverter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -267,6 +269,12 @@ public class MarkerHandlerDataConverterTest {
     assertEquals(6L, fromDetails.getEventId());
     assertEquals(1, fromDetails.getAccessCount());
     assertNull(fromDetails.getData());
+  }
+
+  @Test
+  public void testUnknownPropertiesAreIgnoredSilently() throws Throwable {
+    assertEquals(
+        Collections.emptyList(), compatibilityLogOf(this::testUnknownPropertiesAreIgnored));
   }
 
   private static MarkerRecordedEventAttributes markerAttributes(Header header, byte[] details) {

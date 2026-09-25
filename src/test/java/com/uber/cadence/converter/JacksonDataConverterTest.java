@@ -19,6 +19,10 @@ package com.uber.cadence.converter;
 
 import static org.junit.Assert.*;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonFormat;
@@ -102,7 +106,10 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.junit.Test;
+import org.junit.function.ThrowingRunnable;
+import org.slf4j.LoggerFactory;
 
 public class JacksonDataConverterTest {
 
@@ -2048,6 +2055,36 @@ public class JacksonDataConverterTest {
     return module;
   }
 
+  /**
+   * Runs the action and returns what it logged, in this thread, with the logger of the messages
+   * about the differences between JacksonDataConverter and JsonDataConverter.
+   */
+  public static List<ILoggingEvent> compatibilityLogOf(ThrowingRunnable action) throws Throwable {
+    Logger logger =
+        (Logger)
+            LoggerFactory.getLogger(JacksonDataConverter.class.getName() + ".GsonCompatibility");
+    ListAppender<ILoggingEvent> appender = new ListAppender<>();
+    appender.start();
+    Level level = logger.getLevel();
+    boolean additive = logger.isAdditive();
+    logger.setLevel(Level.ALL);
+    logger.setAdditive(false);
+    logger.addAppender(appender);
+    try {
+      action.run();
+    } finally {
+      logger.detachAppender(appender);
+      logger.setAdditive(additive);
+      logger.setLevel(level);
+    }
+    String thread = Thread.currentThread().getName();
+    return appender
+        .list
+        .stream()
+        .filter(event -> thread.equals(event.getThreadName()))
+        .collect(Collectors.toList());
+  }
+
   private static final String INTERCEPTOR_MESSAGE =
       "mapperInterceptor must return the ObjectMapper it was given, or a copy() of it";
 
@@ -2237,6 +2274,25 @@ public class JacksonDataConverterTest {
     assertEquals("d", params.getDomain());
     assertEquals("w", params.getExecutions().get(0).getWorkflowId());
     assertEquals("r", params.getExecutions().get(0).getRunId());
+  }
+
+  /** Only the unknown properties of the values of the application are logged. */
+  @Test
+  public void testUnknownPropertiesOfClientPayloadsAreNotLogged() throws Throwable {
+    String unknown = "unknown" + UUID.randomUUID().toString().replace("-", "");
+    List<ILoggingEvent> logged =
+        compatibilityLogOf(
+            () -> {
+              testUnknownPropertiesOfClientPayloadsIgnoreCustomization();
+              converter.fromData(
+                  utf8("{\"name\":\"n\",\"" + unknown + "\":1}"), Item.class, Item.class);
+            });
+    assertEquals(1, logged.size());
+    assertEquals(Level.WARN, logged.get(0).getLevel());
+    assertTrue(
+        logged.get(0).getFormattedMessage(),
+        logged.get(0).getFormattedMessage().contains(unknown)
+            && logged.get(0).getFormattedMessage().contains(Item.class.getName()));
   }
 
   private static Object newInstance(String className, Class<?>[] parameterTypes, Object... args)
