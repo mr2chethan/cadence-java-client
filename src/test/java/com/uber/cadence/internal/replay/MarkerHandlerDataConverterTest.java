@@ -1,0 +1,167 @@
+/*
+ *  Copyright 2012-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Modifications copyright (C) 2017 Uber Technologies, Inc.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"). You may not
+ *  use this file except in compliance with the License. A copy of the License is
+ *  located at
+ *
+ *  http://aws.amazon.com/apache2.0
+ *
+ *  or in the "license" file accompanying this file. This file is distributed on
+ *  an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+ *  express or implied. See the License for the specific language governing
+ *  permissions and limitations under the License.
+ */
+
+package com.uber.cadence.internal.replay;
+
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.google.common.base.Splitter;
+import com.uber.cadence.EventType;
+import com.uber.cadence.Header;
+import com.uber.cadence.HistoryEvent;
+import com.uber.cadence.MarkerRecordedEventAttributes;
+import com.uber.cadence.converter.DataConverter;
+import com.uber.cadence.converter.JacksonDataConverter;
+import com.uber.cadence.converter.JsonDataConverter;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.mockito.ArgumentCaptor;
+
+/**
+ * The headers of version and mutable side effect markers are encoded with the data converter of the
+ * worker, so every converter has to be able to decode them.
+ */
+@RunWith(Parameterized.class)
+public class MarkerHandlerDataConverterTest {
+
+  private final DataConverter converter;
+
+  public MarkerHandlerDataConverterTest(String name, DataConverter converter) {
+    this.converter = converter;
+  }
+
+  @Parameterized.Parameters(name = "{0}")
+  public static Collection<Object[]> converters() {
+    List<Object[]> result = new ArrayList<>();
+    for (String name :
+        Splitter.on(',')
+            .trimResults()
+            .omitEmptyStrings()
+            .split(System.getProperty("cadence.test.converters", "gson,jackson"))) {
+      switch (name) {
+        case "gson":
+          result.add(new Object[] {name, JsonDataConverter.getInstance()});
+          break;
+        case "jackson":
+          result.add(new Object[] {name, JacksonDataConverter.getInstance()});
+          break;
+        default:
+          throw new IllegalArgumentException("Unknown converter: " + name);
+      }
+    }
+    return result;
+  }
+
+  @Test
+  public void testMarkerHeaderRoundTrip() {
+    byte[] data = converter.toData(3);
+    MarkerHandler.MarkerData marker = new MarkerHandler.MarkerData("cid1", 5, data, 2);
+
+    MarkerHandler.MarkerInterface decoded =
+        MarkerHandler.MarkerInterface.fromEventAttributes(
+            markerAttributes(marker.getHeader(converter), data), converter);
+
+    assertEquals("cid1", decoded.getId());
+    assertEquals(5L, decoded.getEventId());
+    assertEquals(2, decoded.getAccessCount());
+    assertArrayEquals(data, decoded.getData());
+  }
+
+  @Test
+  public void testLegacyMarkerWithoutHeaderRoundTrip() {
+    byte[] data = converter.toData(3);
+    byte[] details = converter.toData(new MarkerHandler.PlainMarkerData("cid1", 5, data, 1));
+
+    MarkerHandler.MarkerInterface decoded =
+        MarkerHandler.MarkerInterface.fromEventAttributes(
+            markerAttributes(null, details), converter);
+
+    assertEquals("cid1", decoded.getId());
+    assertEquals(5L, decoded.getEventId());
+    assertEquals(1, decoded.getAccessCount());
+    assertArrayEquals(data, decoded.getData());
+  }
+
+  /**
+   * Records a version marker the way Workflow.getVersion does and then replays it, which decodes
+   * the recorded header with the same converter.
+   */
+  @Test
+  public void testRecordedMarkerIsFoundOnReplay() {
+    byte[] version = converter.toData(3);
+    DecisionsHelper recordingDecisions = mock(DecisionsHelper.class);
+    when(recordingDecisions.getNextDecisionEventId()).thenReturn(5L);
+    MarkerHandler recorder =
+        new MarkerHandler(
+            recordingDecisions, ClockDecisionContext.VERSION_MARKER_NAME, () -> false);
+
+    MarkerHandler.HandleResult recorded =
+        recorder.handle("changeId", converter, stored -> Optional.of(version));
+
+    assertTrue(recorded.isNewlyStored());
+    ArgumentCaptor<Header> header = ArgumentCaptor.forClass(Header.class);
+    verify(recordingDecisions)
+        .recordMarker(eq(ClockDecisionContext.VERSION_MARKER_NAME), header.capture(), eq(version));
+
+    HistoryEvent event = new HistoryEvent();
+    event.setEventId(5L);
+    event.setEventType(EventType.MarkerRecorded);
+    event.setMarkerRecordedEventAttributes(
+        markerAttributes(header.getValue(), version)
+            .setMarkerName(ClockDecisionContext.VERSION_MARKER_NAME));
+    DecisionsHelper replayDecisions = mock(DecisionsHelper.class);
+    when(replayDecisions.getNextDecisionEventId()).thenReturn(5L);
+    when(replayDecisions.getOptionalDecisionEvent(5L)).thenReturn(Optional.of(event));
+    MarkerHandler replayer =
+        new MarkerHandler(replayDecisions, ClockDecisionContext.VERSION_MARKER_NAME, () -> true);
+
+    MarkerHandler.HandleResult replayed =
+        replayer.handle(
+            "changeId",
+            converter,
+            stored -> {
+              fail("The recorded value must be used on replay");
+              return Optional.empty();
+            });
+
+    assertFalse(replayed.isNewlyStored());
+    assertTrue(replayed.getStoredData().isPresent());
+    assertEquals(
+        Integer.valueOf(3),
+        converter.fromData(replayed.getStoredData().get(), Integer.class, Integer.class));
+    verify(replayDecisions)
+        .recordMarker(eq(ClockDecisionContext.VERSION_MARKER_NAME), any(Header.class), eq(version));
+  }
+
+  private static MarkerRecordedEventAttributes markerAttributes(Header header, byte[] details) {
+    return new MarkerRecordedEventAttributes().setHeader(header).setDetails(details);
+  }
+}

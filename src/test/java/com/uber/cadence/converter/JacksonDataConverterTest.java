@@ -19,6 +19,9 @@ package com.uber.cadence.converter;
 
 import static org.junit.Assert.*;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.uber.cadence.client.ApplicationFailureException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Type;
@@ -32,12 +35,19 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.UUID;
+import java.util.function.Function;
 import org.junit.Test;
 
 public class JacksonDataConverterTest {
@@ -516,5 +526,235 @@ public class JacksonDataConverterTest {
     assertEquals("outer", fromConverted.getMessage());
     assertNotNull(fromConverted.getCause());
     assertEquals("inner cause", fromConverted.getCause().getMessage());
+  }
+
+  private static byte[] utf8(String json) {
+    return json.getBytes(StandardCharsets.UTF_8);
+  }
+
+  private static String asString(byte[] data) {
+    return new String(data, StandardCharsets.UTF_8);
+  }
+
+  // -------- Empty payloads (JsonDataConverter compatibility) --------
+
+  private static List<byte[]> blankPayloads() {
+    return Arrays.asList(new byte[0], utf8(" \n\t\r"));
+  }
+
+  @Test
+  public void testBlankPayloadDecodesAsNull() {
+    DataConverter json = JsonDataConverter.getInstance();
+    for (byte[] blank : blankPayloads()) {
+      for (DataConverter c : Arrays.asList(converter, json)) {
+        String name = c.getClass().getSimpleName();
+        assertNull(name, c.fromData(blank, String.class, String.class));
+        assertNull(name, c.fromData(blank, Integer.class, Integer.class));
+        assertNull(name, c.fromData(blank, int.class, int.class));
+        assertNull(name, c.fromData(blank, Void.class, Void.class));
+        assertNull(name, c.fromData(blank, SimplePojo.class, SimplePojo.class));
+        assertNull(name, c.fromData(blank, RuntimeException.class, RuntimeException.class));
+      }
+    }
+  }
+
+  @Test
+  public void testBlankPayloadArrayMatchesJsonDataConverter() {
+    Type listOfStrings = new TypeReference<List<String>>() {}.getType();
+    DataConverter json = JsonDataConverter.getInstance();
+    for (byte[] blank : blankPayloads()) {
+      for (DataConverter c : Arrays.asList(converter, json)) {
+        String name = c.getClass().getSimpleName();
+        // Read as a single JSON null: the first argument is null, the others get defaults.
+        assertArrayEquals(
+            name, new Object[] {null, 0}, c.fromDataArray(blank, String.class, int.class));
+        assertArrayEquals(
+            name, new Object[] {null, null}, c.fromDataArray(blank, int.class, String.class));
+        assertArrayEquals(
+            name,
+            new Object[] {null, null, false},
+            c.fromDataArray(blank, String.class, listOfStrings, boolean.class));
+        assertArrayEquals(name, new Object[] {null}, c.fromDataArray(blank, String.class));
+        assertArrayEquals(name, new Object[0], c.fromDataArray(blank));
+      }
+    }
+  }
+
+  // -------- Sets keep the order of the payload --------
+
+  public enum Color {
+    RED,
+    ORANGE,
+    YELLOW,
+    GREEN,
+    BLUE,
+    INDIGO,
+    VIOLET,
+    BLACK
+  }
+
+  /** Has no equals and hashCode, so a HashSet would order its instances by identity hash. */
+  public static class Item {
+    String name;
+
+    public Item() {}
+
+    Item(String name) {
+      this.name = name;
+    }
+  }
+
+  public static class SetHolder {
+    Set<Color> colors;
+    AbstractSet<String> names;
+    SortedSet<String> sorted;
+  }
+
+  public static void setArgument(Set<Color> colors) {}
+
+  private static final String REVERSED_COLORS =
+      "[\"BLACK\",\"VIOLET\",\"INDIGO\",\"BLUE\",\"GREEN\",\"YELLOW\",\"ORANGE\",\"RED\"]";
+
+  private static List<Color> reversedColors() {
+    List<Color> colors = new ArrayList<>(Arrays.asList(Color.values()));
+    Collections.reverse(colors);
+    return colors;
+  }
+
+  @Test
+  public void testSetKeepsPayloadOrder() {
+    Type setOfStrings = new TypeReference<Set<String>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Set<String> strings = converter.fromData(utf8("[\"b\",\"a\",\"c\"]"), Set.class, setOfStrings);
+    assertEquals(LinkedHashSet.class, strings.getClass());
+    assertEquals(Arrays.asList("b", "a", "c"), new ArrayList<>(strings));
+
+    Set<?> raw = converter.fromData(utf8("[\"b\",\"a\"]"), Set.class, Set.class);
+    assertEquals(LinkedHashSet.class, raw.getClass());
+    assertEquals(Arrays.asList("b", "a"), new ArrayList<>(raw));
+  }
+
+  @Test
+  public void testEnumSetKeepsPayloadOrder() {
+    Type setOfColors = new TypeReference<Set<Color>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Set<Color> colors = converter.fromData(utf8(REVERSED_COLORS), Set.class, setOfColors);
+    assertEquals(LinkedHashSet.class, colors.getClass());
+    assertEquals(reversedColors(), new ArrayList<>(colors));
+  }
+
+  @Test
+  public void testSetOfObjectsWithoutHashCodeKeepsPayloadOrder() {
+    Type setOfItems = new TypeReference<Set<Item>>() {}.getType();
+    byte[] data = utf8("[{\"name\":\"c\"},{\"name\":\"a\"},{\"name\":\"d\"},{\"name\":\"b\"}]");
+    @SuppressWarnings("unchecked")
+    Set<Item> items = converter.fromData(data, Set.class, setOfItems);
+    assertEquals(LinkedHashSet.class, items.getClass());
+    List<String> names = new ArrayList<>();
+    for (Item item : items) {
+      names.add(item.name);
+    }
+    assertEquals(Arrays.asList("c", "a", "d", "b"), names);
+  }
+
+  @Test
+  public void testSetFieldsKeepPayloadOrder() {
+    byte[] data =
+        utf8(
+            "{\"colors\":[\"BLUE\",\"RED\",\"GREEN\"],"
+                + "\"names\":[\"z\",\"a\",\"m\"],"
+                + "\"sorted\":[\"z\",\"a\",\"m\"]}");
+    SetHolder holder = converter.fromData(data, SetHolder.class, SetHolder.class);
+    assertEquals(LinkedHashSet.class, holder.colors.getClass());
+    assertEquals(Arrays.asList(Color.BLUE, Color.RED, Color.GREEN), new ArrayList<>(holder.colors));
+    assertEquals(LinkedHashSet.class, holder.names.getClass());
+    assertEquals(Arrays.asList("z", "a", "m"), new ArrayList<>(holder.names));
+    // A sorted set stays sorted.
+    assertEquals(TreeSet.class, holder.sorted.getClass());
+    assertEquals(Arrays.asList("a", "m", "z"), new ArrayList<>(holder.sorted));
+  }
+
+  @Test
+  public void testSetArgumentKeepsPayloadOrder() throws NoSuchMethodException {
+    Method m = JacksonDataConverterTest.class.getDeclaredMethod("setArgument", Set.class);
+    Type arg = m.getGenericParameterTypes()[0];
+    Set<Color> colors = new LinkedHashSet<>(reversedColors());
+
+    Object[] single = converter.fromDataArray(converter.toData(colors), arg);
+    assertEquals(LinkedHashSet.class, single[0].getClass());
+    assertEquals(reversedColors(), new ArrayList<>((Set<?>) single[0]));
+
+    Object[] several = converter.fromDataArray(converter.toData("id", colors), String.class, arg);
+    assertEquals("id", several[0]);
+    assertEquals(reversedColors(), new ArrayList<>((Set<?>) several[1]));
+  }
+
+  @Test
+  public void testSetSerializationIsUnchanged() {
+    Set<String> strings = new LinkedHashSet<>(Arrays.asList("b", "a"));
+    assertEquals("[\"b\",\"a\"]", asString(converter.toData(strings)));
+    assertEquals(
+        REVERSED_COLORS, asString(converter.toData(new LinkedHashSet<>(reversedColors()))));
+  }
+
+  // -------- Unusual payloads --------
+
+  public static class ConverterAndClass {
+    DataConverter converter;
+    Class<?> type;
+  }
+
+  @Test
+  public void testDataConverterAndClassFields() {
+    ConverterAndClass holder =
+        converter.fromData(
+            utf8(
+                "{\"converter\":{\"type\":\"JSON\"},\"type\":{\"className\":\"java.lang.String\"}}"),
+            ConverterAndClass.class,
+            ConverterAndClass.class);
+    assertSame(JacksonDataConverter.getInstance(), holder.converter);
+    assertEquals(String.class, holder.type);
+
+    for (String json :
+        Arrays.asList(
+            "{\"converter\":{}}",
+            "{\"converter\":{\"type\":\"XML\"}}",
+            "{\"type\":{}}",
+            "{\"type\":{\"className\":\"com.example.Missing\"}}")) {
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), ConverterAndClass.class, ConverterAndClass.class));
+    }
+  }
+
+  public static class SelfReference {
+    final SelfReference self = this;
+  }
+
+  @Test
+  public void testValueThatCannotBeSerialized() {
+    assertThrows(DataConverterException.class, () -> converter.toData(new SelfReference()));
+  }
+
+  // -------- Customized ObjectMapper --------
+
+  @Test
+  public void testCustomizedMapperKeepsCadenceHandling() {
+    List<Function<ObjectMapper, ObjectMapper>> interceptors =
+        Arrays.asList(
+            mapper -> mapper,
+            ObjectMapper::copy,
+            mapper -> mapper.copy().registerModule(new SimpleModule("application-module")));
+    for (Function<ObjectMapper, ObjectMapper> interceptor : interceptors) {
+      DataConverter custom = new JacksonDataConverter(interceptor);
+
+      Type setOfColors = new TypeReference<Set<Color>>() {}.getType();
+      @SuppressWarnings("unchecked")
+      Set<Color> colors = custom.fromData(utf8(REVERSED_COLORS), Set.class, setOfColors);
+      assertEquals(reversedColors(), new ArrayList<>(colors));
+
+      assertNull(custom.fromData(new byte[0], String.class, String.class));
+    }
   }
 }

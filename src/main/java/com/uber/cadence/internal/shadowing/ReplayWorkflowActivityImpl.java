@@ -243,13 +243,18 @@ public final class ReplayWorkflowActivityImpl implements ReplayWorkflowActivity 
     }
   }
 
-  private class HeartbeatDetail {
+  private static class HeartbeatDetail {
     private final ReplayWorkflowActivityResult replayResult;
     private final int replayExecutionIndex;
 
     public HeartbeatDetail(ReplayWorkflowActivityResult replayResult, int replayExecutionIndex) {
       this.replayResult = replayResult;
       this.replayExecutionIndex = replayExecutionIndex;
+    }
+
+    // Used by data converters that need a no-arg constructor to deserialize the details.
+    private HeartbeatDetail() {
+      this(null, 0);
     }
 
     public ReplayWorkflowActivityResult getReplayResult() {

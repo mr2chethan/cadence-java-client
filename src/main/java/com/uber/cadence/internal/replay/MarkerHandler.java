@@ -95,6 +95,11 @@ class MarkerHandler {
         this.eventId = eventId;
         this.accessCount = accessCount;
       }
+
+      // Used by data converters that need a no-arg constructor to deserialize the header.
+      private MarkerHeader() {
+        this(null, 0, 0);
+      }
     }
 
     private final MarkerHeader header;
@@ -150,6 +155,11 @@ class MarkerHandler {
       this.eventId = eventId;
       this.data = data;
       this.accessCount = accessCount;
+    }
+
+    // Used by data converters that need a no-arg constructor to deserialize the marker.
+    private PlainMarkerData() {
+      this(null, 0, null, 0);
     }
 
     @Override

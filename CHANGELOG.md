@@ -3,6 +3,8 @@
 ## Unreleased
 - Add GetVersionOptions to Workflow.getVersion() for controlled version selection (executeWithVersion, executeWithMinVersion)
 - Fix WorkflowReplayer not closing the TestWorkflowEnvironment it creates for each replay
+- Add JacksonDataConverter, an opt-in Jackson based alternative to JsonDataConverter that supports java.time types, also on JDK 16 and later (#1094)
+- Fix JacksonDataConverter failing on the client's own records (getVersion, mutableSideEffect and local activity markers, retry options, shadowing heartbeats) and on empty payloads, and decoding a Set in hash order
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)
