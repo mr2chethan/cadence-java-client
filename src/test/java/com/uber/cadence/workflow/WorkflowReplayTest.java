@@ -14,6 +14,9 @@
  */
 package com.uber.cadence.workflow;
 
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+
 import com.uber.cadence.testing.WorkflowReplayer;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -112,5 +115,34 @@ public class WorkflowReplayTest {
   public void testChildWorkflowRetryReplay() throws Exception {
     WorkflowReplayer.replayWorkflowExecutionFromResource(
         "testChildWorkflowRetryHistory.json", WorkflowTest.TestChildWorkflowRetryWorkflow.class);
+  }
+
+  /** The environment of each replay is closed, also when the replay fails. */
+  @Test
+  public void testReplayClosesItsEnvironment() throws Exception {
+    int before = liveTimerPumps();
+    for (int i = 0; i < 3; i++) {
+      WorkflowReplayer.replayWorkflowExecutionFromResource(
+          "testGetVersionHistory.json", WorkflowTest.TestGetVersionAddedImpl.class);
+      // The history is of another workflow type.
+      assertThrows(
+          Exception.class,
+          () ->
+              WorkflowReplayer.replayWorkflowExecutionFromResource(
+                  "testGetVersionHistory.json", WorkflowTest.TimerFiringWorkflowImpl.class));
+    }
+    int after = liveTimerPumps();
+    assertTrue(before + " timer threads before the replays, " + after + " after", after <= before);
+  }
+
+  /** The number of open test environments: each has one timer thread until it is closed. */
+  private static int liveTimerPumps() {
+    int count = 0;
+    for (Thread thread : Thread.getAllStackTraces().keySet()) {
+      if (thread.isAlive() && thread.getName().equals("SelfAdvancingTimer Pump")) {
+        count++;
+      }
+    }
+    return count;
   }
 }
