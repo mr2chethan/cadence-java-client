@@ -24,6 +24,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.junit.Assume.assumeTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -51,12 +52,23 @@ import org.mockito.ArgumentCaptor;
 
 /**
  * The headers of version and mutable side effect markers are encoded with the data converter of the
- * worker, so every converter has to be able to decode them.
+ * worker, so every converter has to be able to decode them, including headers recorded by
+ * JsonDataConverter.
  */
 @RunWith(Parameterized.class)
 public class MarkerHandlerDataConverterTest {
 
   private static final String HEADER_KEY = "MutableMarkerHeader";
+
+  /** Header of a marker recorded by JsonDataConverter. */
+  private static final String GSON_HEADER = "{\"id\":\"cid1\",\"eventId\":5,\"accessCount\":0}";
+
+  /**
+   * Details of a marker recorded before the header existed, by JsonDataConverter. The data is the
+   * encoded integer 3.
+   */
+  private static final String GSON_LEGACY_DETAILS =
+      "{\"id\":\"cid1\",\"eventId\":5,\"data\":[51],\"accessCount\":1}";
 
   private final DataConverter converter;
 
@@ -103,6 +115,50 @@ public class MarkerHandlerDataConverterTest {
   }
 
   @Test
+  public void testMarkerHeaderIsReadableByAllConverters() {
+    Header header = new MarkerHandler.MarkerData("cid1", 5, null, 1).getHeader(converter);
+
+    for (DataConverter reader :
+        new DataConverter[] {
+          JsonDataConverter.getInstance(),
+          JacksonDataConverter.getInstance(),
+          newCustomizedConverter()
+        }) {
+      MarkerHandler.MarkerInterface decoded =
+          MarkerHandler.MarkerInterface.fromEventAttributes(markerAttributes(header, null), reader);
+      assertEquals("cid1", decoded.getId());
+      assertEquals(5L, decoded.getEventId());
+      assertEquals(1, decoded.getAccessCount());
+    }
+  }
+
+  @Test
+  public void testGsonMarkerHeaderFormatIsUnchanged() {
+    assumeTrue("Checks the format of JsonDataConverter", converter instanceof JsonDataConverter);
+
+    Header header = new MarkerHandler.MarkerData("cid1", 5, null, 0).getHeader(converter);
+
+    assertEquals(
+        GSON_HEADER, new String(header.getFields().get(HEADER_KEY), StandardCharsets.UTF_8));
+  }
+
+  @Test
+  public void testDecodesMarkerHeaderRecordedByGson() {
+    Header header = new Header();
+    header.getFields().put(HEADER_KEY, GSON_HEADER.getBytes(StandardCharsets.UTF_8));
+    byte[] data = converter.toData(3);
+
+    MarkerHandler.MarkerInterface decoded =
+        MarkerHandler.MarkerInterface.fromEventAttributes(
+            markerAttributes(header, data), converter);
+
+    assertEquals("cid1", decoded.getId());
+    assertEquals(5L, decoded.getEventId());
+    assertEquals(0, decoded.getAccessCount());
+    assertArrayEquals(data, decoded.getData());
+  }
+
+  @Test
   public void testLegacyMarkerWithoutHeaderRoundTrip() {
     byte[] data = converter.toData(3);
     byte[] details = converter.toData(new MarkerHandler.PlainMarkerData("cid1", 5, data, 1));
@@ -115,6 +171,20 @@ public class MarkerHandlerDataConverterTest {
     assertEquals(5L, decoded.getEventId());
     assertEquals(1, decoded.getAccessCount());
     assertArrayEquals(data, decoded.getData());
+  }
+
+  @Test
+  public void testDecodesLegacyMarkerRecordedByGson() {
+    MarkerHandler.MarkerInterface decoded =
+        MarkerHandler.MarkerInterface.fromEventAttributes(
+            markerAttributes(null, GSON_LEGACY_DETAILS.getBytes(StandardCharsets.UTF_8)),
+            converter);
+
+    assertEquals("cid1", decoded.getId());
+    assertEquals(5L, decoded.getEventId());
+    assertEquals(1, decoded.getAccessCount());
+    assertEquals(
+        Integer.valueOf(3), converter.fromData(decoded.getData(), Integer.class, Integer.class));
   }
 
   /**

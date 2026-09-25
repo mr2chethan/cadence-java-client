@@ -21,6 +21,7 @@ import static org.junit.Assert.*;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.core.JsonGenerator;
@@ -78,6 +79,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IllegalFormatConversionException;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -1619,6 +1621,35 @@ public class JacksonDataConverterTest {
     assertEquals("cause", result.getCause().getMessage());
   }
 
+  @Test
+  public void testActivityFailureExceptionEncodedByJsonDataConverter() {
+    // As JsonDataConverter writes it, with the Duration as seconds and nanos.
+    String json =
+        "{\"attempt\":3,\"backoff\":{\"seconds\":2,\"nanos\":500},"
+            + "\"activityType\":{\"name\":\"Activities::charge\"},\"activityId\":\"1\","
+            + "\"eventId\":5,\"detailMessage\":\"activity failed\","
+            + "\"cause\":{\"detailMessage\":\"boom\","
+            + "\"stackTrace\":\"com.example.Activities.charge(Activities.java:42)\\n\","
+            + "\"suppressedExceptions\":[],\"class\":\"java.lang.IllegalStateException\"},"
+            + "\"stackTrace\":\"com.example.Workflow.run(Workflow.java:7)\\n\","
+            + "\"suppressedExceptions\":[],"
+            + "\"class\":\"com.uber.cadence.workflow.ActivityFailureException\"}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(ActivityFailureException.class, result.getClass());
+    ActivityFailureException failure = (ActivityFailureException) result;
+    assertEquals("activity failed", failure.getMessage());
+    assertEquals(3, failure.getAttempt());
+    assertEquals(Duration.ofSeconds(2, 500), failure.getBackoff());
+    assertEquals(ACTIVITY_TYPE, failure.getActivityType());
+    assertEquals("1", failure.getActivityId());
+    assertEquals(5, failure.getEventId());
+    assertSameFrame(
+        new StackTraceElement("com.example.Workflow", "run", "Workflow.java", 7),
+        failure.getStackTrace()[0]);
+    assertEquals(IllegalStateException.class, failure.getCause().getClass());
+    assertEquals("boom", failure.getCause().getMessage());
+  }
+
   // -------- Exceptions with a no-arg constructor --------
 
   /** Its no-arg constructor sets a default message, and its fields have initializers. */
@@ -1874,6 +1905,68 @@ public class JacksonDataConverterTest {
     assertThrows(DataConverterException.class, () -> converter.toData(new SelfReference()));
   }
 
+  // -------- Duration in the format of JsonDataConverter --------
+
+  public static class DurationHolder {
+    Duration plain;
+
+    @JsonFormat(pattern = "MILLIS")
+    Duration millis;
+  }
+
+  @Test
+  public void testDurationInJsonDataConverterFormat() {
+    Duration expected = Duration.ofSeconds(5, 7);
+    assertEquals(
+        expected,
+        converter.fromData(utf8("{\"seconds\":5,\"nanos\":7}"), Duration.class, Duration.class));
+    assertEquals(
+        Duration.ofSeconds(5),
+        converter.fromData(utf8("{\"seconds\":5}"), Duration.class, Duration.class));
+    // The format Jackson writes, and ISO-8601, are still read.
+    assertEquals("5.000000007", asString(converter.toData(expected)));
+    assertEquals(expected, converter.fromData(utf8("5.000000007"), Duration.class, Duration.class));
+    assertEquals(
+        Duration.ofSeconds(5),
+        converter.fromData(utf8("\"PT5S\""), Duration.class, Duration.class));
+  }
+
+  @Test
+  public void testDurationFieldsInJsonDataConverterFormat() {
+    DurationHolder holder =
+        converter.fromData(
+            utf8("{\"plain\":{\"seconds\":2,\"nanos\":5},\"millis\":{\"seconds\":3,\"nanos\":0}}"),
+            DurationHolder.class,
+            DurationHolder.class);
+    assertEquals(Duration.ofSeconds(2, 5), holder.plain);
+    assertEquals(Duration.ofSeconds(3), holder.millis);
+
+    // Annotations on the field still apply to the other formats.
+    DurationHolder annotated =
+        converter.fromData(
+            utf8("{\"plain\":1.5,\"millis\":1500}"), DurationHolder.class, DurationHolder.class);
+    assertEquals(Duration.ofMillis(1500), annotated.plain);
+    assertEquals(Duration.ofMillis(1500), annotated.millis);
+  }
+
+  @Test
+  public void testInvalidDurationObjectFails() {
+    for (String json :
+        Arrays.asList(
+            "{\"foo\":1}",
+            "{\"seconds\":\"5\"}",
+            "{}",
+            "{\"seconds\":1.9}",
+            "{\"seconds\":1,\"nanos\":\"x\"}",
+            "{\"seconds\":1,\"nanos\":0.5}",
+            "{\"seconds\":99999999999999999999}")) {
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), Duration.class, Duration.class));
+    }
+  }
+
   // -------- Customized ObjectMapper --------
 
   @Test
@@ -1901,6 +1994,9 @@ public class JacksonDataConverterTest {
       Set<Color> colors = custom.fromData(utf8(REVERSED_COLORS), Set.class, setOfColors);
       assertEquals(reversedColors(), new ArrayList<>(colors));
 
+      assertEquals(
+          Duration.ofSeconds(1),
+          custom.fromData(utf8("{\"seconds\":1,\"nanos\":0}"), Duration.class, Duration.class));
       assertNull(custom.fromData(new byte[0], String.class, String.class));
     }
   }
@@ -1951,6 +2047,20 @@ public class JacksonDataConverterTest {
 
   private static final String INTERCEPTOR_MESSAGE =
       "mapperInterceptor must return the ObjectMapper it was given, or a copy() of it";
+
+  /** {@link #fullRetryOptions()} as JsonDataConverter writes them. */
+  private static final String RETRY_OPTIONS_JSON =
+      "{\"initialInterval\":{\"seconds\":1,\"nanos\":0},\"backoffCoefficient\":1.5,"
+          + "\"expiration\":{\"seconds\":300,\"nanos\":0},\"maximumAttempts\":4,"
+          + "\"maximumInterval\":{\"seconds\":10,\"nanos\":500000000},"
+          + "\"doNotRetry\":[{\"className\":\"java.lang.IllegalStateException\"}]}";
+
+  /** {@link #fullRetryOptions()} written with snake_case names. */
+  private static final String RETRY_OPTIONS_SNAKE_CASE_JSON =
+      "{\"initial_interval\":{\"seconds\":1,\"nanos\":0},\"backoff_coefficient\":1.5,"
+          + "\"expiration\":{\"seconds\":300,\"nanos\":0},\"maximum_attempts\":4,"
+          + "\"maximum_interval\":{\"seconds\":10,\"nanos\":500000000},"
+          + "\"do_not_retry\":[{\"className\":\"java.lang.IllegalStateException\"}]}";
 
   private static RetryOptions fullRetryOptions() {
     return new RetryOptions.Builder()
@@ -2072,8 +2182,10 @@ public class JacksonDataConverterTest {
         Duration.ofSeconds(90),
         custom.fromData(utf8("\"PT1M30S\""), Duration.class, Duration.class));
 
+    // Not the Durations of RetryOptions, which JsonDataConverter has to be able to read.
     RetryOptions options = fullRetryOptions();
     byte[] data = custom.toData(options);
+    assertEquals(RETRY_OPTIONS_JSON, asString(data));
     assertEquals(options, custom.fromData(data, RetryOptions.class, RetryOptions.class));
   }
 
@@ -2088,8 +2200,11 @@ public class JacksonDataConverterTest {
 
     RetryOptions options = fullRetryOptions();
     byte[] data = custom.toData(options);
+    assertEquals(RETRY_OPTIONS_JSON, asString(data));
     assertEquals(options, custom.fromData(data, RetryOptions.class, RetryOptions.class));
     assertEquals(options, custom.fromDataArray(data, RetryOptions.class)[0]);
+    assertEquals(
+        options, custom.fromData(utf8(RETRY_OPTIONS_JSON), RetryOptions.class, RetryOptions.class));
 
     ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
     result.setSucceeded(3);
@@ -2134,6 +2249,8 @@ public class JacksonDataConverterTest {
    */
   @Test
   public void testClientPayloadClasses() throws Exception {
+    String localActivityHeader =
+        "com.uber.cadence.internal.common.LocalActivityMarkerData$LocalActivityMarkerHeader";
     ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
     result.setSucceeded(3);
     result.setSkipped(1);
@@ -2172,6 +2289,28 @@ public class JacksonDataConverterTest {
         "{\"id\":\"p-1\",\"eventId\":3,\"data\":\"AQI=\",\"accessCount\":1}");
     payloads.put(
         newInstance(
+            localActivityHeader,
+            new Class<?>[] {
+              String.class,
+              String.class,
+              long.class,
+              String.class,
+              int.class,
+              Duration.class,
+              boolean.class
+            },
+            "la-1",
+            "Activity::run",
+            99L,
+            null,
+            2,
+            Duration.ofMillis(15500),
+            false),
+        "{\"activityId\":\"la-1\",\"activityType\":\"Activity::run\",\"errReason\":null,"
+            + "\"replayTimeMillis\":99,\"attempt\":2,"
+            + "\"backoff\":{\"seconds\":15,\"nanos\":500000000},\"isCancelled\":false}");
+    payloads.put(
+        newInstance(
             "com.uber.cadence.internal.shadowing.ReplayWorkflowActivityImpl$HeartbeatDetail",
             new Class<?>[] {ReplayWorkflowActivityResult.class, int.class},
             result,
@@ -2189,12 +2328,19 @@ public class JacksonDataConverterTest {
     payloads.put(
         scanResult,
         "{\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\"}],\"nextPageToken\":null}");
+    payloads.put(fullRetryOptions(), RETRY_OPTIONS_JSON);
 
+    Set<String> withGsonShapedDurations =
+        new HashSet<>(Arrays.asList(localActivityHeader, RetryOptions.class.getName()));
     DataConverter custom = newCustomizedConverter();
     for (Map.Entry<Object, String> payload : payloads.entrySet()) {
       Class<?> type = payload.getKey().getClass();
       String json = payload.getValue();
       assertTrue(type.getName(), ClientPayloads.isClientPayload(type));
+      assertEquals(
+          type.getName(),
+          withGsonShapedDurations.contains(type.getName()),
+          ClientPayloads.hasGsonShapedDurations(type));
       assertEquals(json, asString(converter.toData(payload.getKey())));
       assertEquals(json, asString(custom.toData(payload.getKey())));
       Object decoded = custom.fromData(utf8(json), type, type);
@@ -2210,10 +2356,12 @@ public class JacksonDataConverterTest {
             "com.uber.cadence.internal.replay.ActivityTaskFailedException")) {
       Class<?> type = Class.forName(exception);
       assertFalse(exception, ClientPayloads.isClientPayload(type));
+      assertFalse(exception, ClientPayloads.hasGsonShapedDurations(type));
     }
     for (Class<?> type :
         Arrays.asList(SimplePojo.class, WorkflowExecution.class, String.class, Duration.class)) {
       assertFalse(type.getName(), ClientPayloads.isClientPayload(type));
+      assertFalse(type.getName(), ClientPayloads.hasGsonShapedDurations(type));
     }
   }
 
@@ -2266,9 +2414,45 @@ public class JacksonDataConverterTest {
     RetryOptions options = fullRetryOptions();
 
     byte[] data = snakeCase.toData(options, "x");
+    assertEquals("[" + RETRY_OPTIONS_SNAKE_CASE_JSON + ",\"x\"]", asString(data));
     assertArrayEquals(
         new Object[] {options, "x"},
         snakeCase.fromDataArray(data, RetryOptions.class, String.class));
+
+    // A single value is written as JsonDataConverter writes it.
+    assertEquals(RETRY_OPTIONS_JSON, asString(snakeCase.toData(options)));
+  }
+
+  /** Holds data of the client in a value of the application. */
+  public static final class RetryPolicy {
+    RetryOptions options;
+    Duration timeout;
+  }
+
+  /**
+   * The Durations of RetryOptions inside values of the application are read in the form they are
+   * written in, also when the application reads Durations only in another form.
+   */
+  @Test
+  public void testRetryOptionsInValuesWithApplicationDurationDeserializer() {
+    DataConverter custom =
+        new JacksonDataConverter(mapper -> mapper.registerModule(isoDurationModule()));
+    RetryOptions options = fullRetryOptions();
+
+    byte[] data = custom.toData(options, "x");
+    assertEquals("[" + RETRY_OPTIONS_JSON + ",\"x\"]", asString(data));
+    assertArrayEquals(
+        new Object[] {options, "x"}, custom.fromDataArray(data, RetryOptions.class, String.class));
+
+    RetryPolicy policy = new RetryPolicy();
+    policy.options = options;
+    policy.timeout = Duration.ofSeconds(90);
+    byte[] policyData = custom.toData(policy);
+    assertEquals(
+        "{\"options\":" + RETRY_OPTIONS_JSON + ",\"timeout\":\"PT1M30S\"}", asString(policyData));
+    RetryPolicy decoded = custom.fromData(policyData, RetryPolicy.class, RetryPolicy.class);
+    assertEquals(options, decoded.options);
+    assertEquals(Duration.ofSeconds(90), decoded.timeout);
   }
 
   /** The array of the values is not typed, only the values in it. */
@@ -2336,6 +2520,14 @@ public class JacksonDataConverterTest {
     assertEquals(
         Optional.empty(),
         converter.fromData(utf8("{}"), MaybeHolder.class, MaybeHolder.class).maybe);
+
+    // Not to the data of the client.
+    RetryOptions options = fullRetryOptions();
+    assertEquals(RETRY_OPTIONS_JSON, asString(custom.toData(options)));
+    byte[] data = custom.toData(options, "x");
+    assertEquals("[" + RETRY_OPTIONS_JSON + ",\"x\"]", asString(data));
+    assertArrayEquals(
+        new Object[] {options, "x"}, custom.fromDataArray(data, RetryOptions.class, String.class));
   }
 
   @Test
@@ -2346,6 +2538,7 @@ public class JacksonDataConverterTest {
 
     // The value is a List, so the configured mapper writes and reads it.
     byte[] data = snakeCase.toData(list);
+    assertEquals("[" + RETRY_OPTIONS_SNAKE_CASE_JSON + "]", asString(data));
     assertEquals(list, snakeCase.fromData(data, List.class, listOfOptions));
     assertEquals(list, snakeCase.fromDataArray(data, listOfOptions)[0]);
 
@@ -2423,6 +2616,7 @@ public class JacksonDataConverterTest {
       Method fromData = type.getMethod("fromData", byte[].class, Class.class, Type.class);
       for (Object c : singletonFirst ? Arrays.asList(instance) : Arrays.asList(custom, instance)) {
         byte[] data = (byte[]) toData.invoke(c, new Object[] {new Object[] {options}});
+        assertEquals(RETRY_OPTIONS_JSON, asString(data));
         assertEquals(options, fromData.invoke(c, data, RetryOptions.class, RetryOptions.class));
       }
     }

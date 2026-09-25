@@ -22,6 +22,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
+import static org.junit.Assume.assumeTrue;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect.Visibility;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
@@ -52,7 +53,9 @@ import com.uber.cadence.client.WorkflowStub;
 import com.uber.cadence.common.RetryOptions;
 import com.uber.cadence.common.WorkflowExecutionHistory;
 import com.uber.cadence.converter.DataConverter;
+import com.uber.cadence.converter.DataConverterException;
 import com.uber.cadence.converter.JacksonDataConverter;
+import com.uber.cadence.converter.JsonDataConverter;
 import com.uber.cadence.internal.common.WorkflowExecutionUtils;
 import com.uber.cadence.testUtils.TestEnvironment;
 import com.uber.cadence.testing.TestEnvironmentOptions;
@@ -87,7 +90,7 @@ import org.junit.runners.Parameterized.Parameters;
  * records for itself (the markers of getVersion, local activities and mutableSideEffect and the
  * RetryOptions of Workflow.retry), these customizations would change their JSON or make it
  * unreadable. The histories recorded with a customized converter replay with the default
- * JacksonDataConverter, and the other way around.
+ * JacksonDataConverter and with JsonDataConverter, and the other way around.
  */
 @RunWith(Parameterized.class)
 public class DataConverterCustomizationIntegrationTest {
@@ -155,6 +158,14 @@ public class DataConverterCustomizationIntegrationTest {
   @Test
   public void testDefaultConverterReplaysHistory() throws Exception {
     replay(JacksonDataConverter.getInstance(), record(converter));
+  }
+
+  @Test
+  public void testJsonDataConverterReplaysHistory() throws Exception {
+    assumeTrue(
+        "JsonDataConverter cannot convert java.time.Duration in this JVM",
+        canConvertWithGson(Duration.ofSeconds(1)));
+    replay(JsonDataConverter.getInstance(), record(converter));
   }
 
   @Test
@@ -339,6 +350,7 @@ public class DataConverterCustomizationIntegrationTest {
   /** The client's own payloads are written as the default JacksonDataConverter writes them. */
   private static void assertClientPayloadsHaveDefaultForm(WorkflowExecutionHistory history) {
     List<String> headers = new ArrayList<>();
+    List<String> details = new ArrayList<>();
     for (HistoryEvent event : history.getEvents()) {
       MarkerRecordedEventAttributes marker = event.getMarkerRecordedEventAttributes();
       if (marker == null) {
@@ -349,9 +361,14 @@ public class DataConverterCustomizationIntegrationTest {
           headers.add(new String(value, StandardCharsets.UTF_8));
         }
       }
+      if (marker.getDetails() != null) {
+        details.add(new String(marker.getDetails(), StandardCharsets.UTF_8));
+      }
     }
     assertContains(headers, "{\"id\":\"customization\",\"eventId\":");
     assertContains(headers, "\"errReason\":\"java.lang.IllegalStateException\"");
+    assertContains(headers, "\"backoff\":{\"seconds\":15,\"nanos\":0}");
+    assertContains(details, "{\"initialInterval\":{\"seconds\":1,\"nanos\":0},");
   }
 
   private static void assertContains(List<String> values, String expected) {
@@ -361,6 +378,16 @@ public class DataConverterCustomizationIntegrationTest {
       }
     }
     throw new AssertionError("No value contains " + expected + ": " + values);
+  }
+
+  private static boolean canConvertWithGson(Object value) {
+    DataConverter gson = JsonDataConverter.getInstance();
+    try {
+      gson.fromData(gson.toData(value), value.getClass(), value.getClass());
+      return true;
+    } catch (DataConverterException e) {
+      return false;
+    }
   }
 
   private static RetryOptions.Builder retryOptions(Duration initialInterval) {

@@ -22,13 +22,16 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeNoException;
+import static org.junit.Assume.assumeTrue;
 
 import com.google.common.base.Splitter;
 import com.uber.cadence.converter.DataConverter;
 import com.uber.cadence.converter.DataConverterException;
 import com.uber.cadence.converter.JacksonDataConverter;
 import com.uber.cadence.converter.JsonDataConverter;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,10 +45,19 @@ import org.junit.runners.Parameterized;
 /**
  * Workflow.retry records its RetryOptions with the data converter of the worker (as a mutable side
  * effect) and compares the recorded value with equals, so the options have to survive a round trip
- * through every converter unchanged.
+ * through every converter unchanged, including options recorded by JsonDataConverter.
  */
 @RunWith(Parameterized.class)
 public class RetryOptionsDataConverterTest {
+
+  /** Options of {@link #fullOptions()} as recorded by JsonDataConverter. */
+  private static final String GSON_OPTIONS =
+      "{\"initialInterval\":{\"seconds\":1,\"nanos\":0},\"backoffCoefficient\":1.5,"
+          + "\"expiration\":{\"seconds\":300,\"nanos\":0},\"maximumAttempts\":4,"
+          + "\"maximumInterval\":{\"seconds\":10,\"nanos\":500000000},"
+          + "\"doNotRetry\":[{\"className\":\"java.lang.IllegalStateException\"},"
+          + "{\"className\":"
+          + "\"com.uber.cadence.common.RetryOptionsDataConverterTest$QuotaException\"}]}";
 
   private final DataConverter converter;
 
@@ -143,6 +155,48 @@ public class RetryOptionsDataConverterTest {
     for (int attempt = 1; attempt <= 4; attempt++) {
       assertEquals(options.calculateSleepTime(attempt), decoded.calculateSleepTime(attempt));
     }
+  }
+
+  @Test
+  public void testGsonFormatIsUnchanged() {
+    assumeTrue("Checks the format of JsonDataConverter", converter instanceof JsonDataConverter);
+    assumeDurationIsSupported();
+
+    assertEquals(GSON_OPTIONS, new String(converter.toData(fullOptions()), StandardCharsets.UTF_8));
+  }
+
+  /** Written as JsonDataConverter writes them, whatever the configuration of the ObjectMapper. */
+  @Test
+  public void testJacksonWritesGsonFormat() {
+    assumeFalse(
+        "Checks the format of JacksonDataConverter", converter instanceof JsonDataConverter);
+
+    assertEquals(GSON_OPTIONS, new String(converter.toData(fullOptions()), StandardCharsets.UTF_8));
+  }
+
+  /** JsonDataConverter reads the options written by every converter, for example on a rollback. */
+  @Test
+  public void testGsonReadsOptionsWrittenByThisConverter() {
+    DataConverter gson = JsonDataConverter.getInstance();
+    assumeDurationIsSupported(gson);
+    RetryOptions options = fullOptions();
+
+    RetryOptions decoded =
+        gson.fromData(converter.toData(options), RetryOptions.class, RetryOptions.class);
+
+    assertEquals(options, decoded);
+    assertEquals(Duration.ofMillis(10500), decoded.getMaximumInterval());
+  }
+
+  @Test
+  public void testDecodesOptionsRecordedByGson() {
+    assumeDurationIsSupported();
+
+    RetryOptions decoded =
+        converter.fromData(
+            GSON_OPTIONS.getBytes(StandardCharsets.UTF_8), RetryOptions.class, RetryOptions.class);
+
+    assertEquals(fullOptions(), decoded);
   }
 
   private RetryOptions roundTrip(RetryOptions options) {

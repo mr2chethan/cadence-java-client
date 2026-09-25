@@ -217,6 +217,27 @@ public class DataConverterIntegrationTest {
   }
 
   @Test
+  public void testReplayHistoryRecordedWithJsonDataConverter() throws Exception {
+    assumeFalse(
+        "Accepts only payloads it wrote itself", converter instanceof PrefixingDataConverter);
+    assumeTrue(
+        "JsonDataConverter cannot convert java.time.Duration in this JVM",
+        canConvertWithGson(Duration.ofSeconds(1)));
+    TestWorkflowEnvironment recorder =
+        startEnvironment(JsonDataConverter.getInstance(), new TestActivitiesImpl());
+    replay(runMarkersScenario(recorder));
+  }
+
+  @Test
+  public void testJacksonRecordedHistoryReplaysWithGson() throws Exception {
+    assumeTrue("Records with JacksonDataConverter", converter instanceof JacksonDataConverter);
+    assumeTrue(
+        "JsonDataConverter cannot convert java.time.Duration in this JVM",
+        canConvertWithGson(Duration.ofSeconds(1)));
+    replay(JsonDataConverter.getInstance(), runMarkersScenario(testEnvironment));
+  }
+
+  @Test
   public void testActivityFailureCause() throws Exception {
     assertEquals(
         codeExceptionDescription("rejectWithCode"), runScenario(Scenario.CATCH_ACTIVITY_FAILURE));

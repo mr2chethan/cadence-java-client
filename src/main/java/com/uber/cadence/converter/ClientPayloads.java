@@ -17,6 +17,7 @@
 
 package com.uber.cadence.converter;
 
+import com.google.common.collect.ImmutableSet;
 import com.uber.cadence.common.RetryOptions;
 
 /**
@@ -26,6 +27,15 @@ import com.uber.cadence.common.RetryOptions;
  */
 final class ClientPayloads {
 
+  /**
+   * Client payloads with Duration fields, which JacksonDataConverter writes in the form that
+   * JsonDataConverter writes and reads, so that a worker using JsonDataConverter can replay them.
+   */
+  private static final ImmutableSet<String> GSON_SHAPED_DURATIONS =
+      ImmutableSet.of(
+          "com.uber.cadence.internal.common.LocalActivityMarkerData$LocalActivityMarkerHeader",
+          RetryOptions.class.getName());
+
   private ClientPayloads() {}
 
   /** Whether values of the type are client payloads. Exceptions are not. */
@@ -33,5 +43,10 @@ final class ClientPayloads {
     return type == RetryOptions.class
         || (type.getName().startsWith("com.uber.cadence.internal.")
             && !Throwable.class.isAssignableFrom(type));
+  }
+
+  /** Whether the Duration fields of the type are written as {"seconds":..,"nanos":..}. */
+  static boolean hasGsonShapedDurations(Class<?> type) {
+    return GSON_SHAPED_DURATIONS.contains(type.getName());
   }
 }
