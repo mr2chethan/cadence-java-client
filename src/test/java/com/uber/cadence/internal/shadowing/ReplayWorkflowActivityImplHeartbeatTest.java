@@ -17,6 +17,7 @@
 
 package com.uber.cadence.internal.shadowing;
 
+import static com.uber.cadence.converter.JacksonDataConverterTest.compatibilityLogOf;
 import static com.uber.cadence.converter.JacksonDataConverterTest.newCustomizedConverter;
 import static org.junit.Assert.assertEquals;
 
@@ -29,6 +30,7 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import org.junit.Test;
@@ -117,6 +119,13 @@ public class ReplayWorkflowActivityImplHeartbeatTest {
     assertProgress(converter.fromData(details, detailClass, detailClass));
   }
 
+  @Test
+  public void testUnknownPropertiesOfHeartbeatDetailAreIgnoredSilently() throws Throwable {
+    assertEquals(
+        Collections.emptyList(),
+        compatibilityLogOf(this::testUnknownPropertiesOfHeartbeatDetailAreIgnored));
+  }
+
   /**
    * The shadowing workflow, which the Cadence server runs, passes the parameters of the activity
    * and reads its result.
@@ -147,6 +156,13 @@ public class ReplayWorkflowActivityImplHeartbeatTest {
     assertEquals(
         "{\"succeeded\":3,\"skipped\":1,\"failed\":2}",
         new String(converter.toData(result), StandardCharsets.UTF_8));
+  }
+
+  @Test
+  public void testActivityParametersWrittenByShadowingWorkflowAreReadSilently() throws Throwable {
+    assertEquals(
+        Collections.emptyList(),
+        compatibilityLogOf(this::testActivityParametersWrittenByShadowingWorkflow));
   }
 
   private static Class<?> heartbeatDetailClass() throws ClassNotFoundException {

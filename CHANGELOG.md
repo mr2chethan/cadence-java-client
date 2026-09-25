@@ -13,6 +13,7 @@
 - JacksonDataConverter reads what JsonDataConverter wrote, and adds gsonCompatibleNumbersModule() to decode untyped numbers as Double like Gson. Switching back is not supported for open workflows; see its javadoc
 - JacksonDataConverter applies Gson's @SerializedName to fields and enum constants, like JsonDataConverter
 - JacksonDataConverter writes and reads Gson's JsonElement types as the JSON they represent, like JsonDataConverter
+- JacksonDataConverter logs the payload properties it skips and the classes it writes or reads differently from JsonDataConverter, and warns about Gson @JsonAdapter annotations it ignores
 
 ## 3.12.7
 - Release use versions from git tags instead of static value (#1002)
