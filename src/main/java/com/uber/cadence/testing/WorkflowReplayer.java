@@ -20,7 +20,9 @@ package com.uber.cadence.testing;
 import com.google.common.collect.ObjectArrays;
 import com.uber.cadence.TaskList;
 import com.uber.cadence.WorkflowExecutionStartedEventAttributes;
+import com.uber.cadence.client.WorkflowClientOptions;
 import com.uber.cadence.common.WorkflowExecutionHistory;
+import com.uber.cadence.converter.DataConverter;
 import com.uber.cadence.internal.common.WorkflowExecutionUtils;
 import com.uber.cadence.worker.Worker;
 import java.io.File;
@@ -96,13 +98,72 @@ public final class WorkflowReplayer {
   public static void replayWorkflowExecution(
       WorkflowExecutionHistory history, Class<?> workflowClass, Class<?>... moreWorkflowClasses)
       throws Exception {
-    WorkflowExecutionStartedEventAttributes attr =
-        history.getEvents().get(0).getWorkflowExecutionStartedEventAttributes();
-    TaskList taskList = attr.getTaskList();
-    TestWorkflowEnvironment testEnv = TestWorkflowEnvironment.newInstance();
-    Worker worker = testEnv.newWorker(taskList.getName());
-    worker.registerWorkflowImplementationTypes(
-        ObjectArrays.concat(moreWorkflowClasses, workflowClass));
-    worker.replayWorkflowExecution(history);
+    replay(TestWorkflowEnvironment.newInstance(), history, workflowClass, moreWorkflowClasses);
+  }
+
+  /**
+   * Replays workflow from a resource that contains a json serialized history, decoding its payloads
+   * with the given data converter, which must be the one the workers of the workflow use.
+   *
+   * @param resourceName name of the resource
+   * @param dataConverter data converter of the workflow
+   * @param workflowClass workflow implementation class to replay
+   * @param moreWorkflowClasses optional additional workflow implementation classes
+   * @throws Exception if replay failed for any reason.
+   */
+  public static void replayWorkflowExecutionFromResource(
+      String resourceName,
+      DataConverter dataConverter,
+      Class<?> workflowClass,
+      Class<?>... moreWorkflowClasses)
+      throws Exception {
+    WorkflowExecutionHistory history = WorkflowExecutionUtils.readHistoryFromResource(resourceName);
+    replayWorkflowExecution(history, dataConverter, workflowClass, moreWorkflowClasses);
+  }
+
+  /**
+   * Replays workflow from a {@link WorkflowExecutionHistory}, decoding its payloads with the given
+   * data converter, which must be the one the workers of the workflow use. RunId <b>must</b> match
+   * the one used to generate the serialized history.
+   *
+   * @param history object that contains the workflow ids and the events.
+   * @param dataConverter data converter of the workflow
+   * @param workflowClass workflow implementation class to replay
+   * @param moreWorkflowClasses optional additional workflow implementation classes
+   * @throws Exception if replay failed for any reason.
+   */
+  public static void replayWorkflowExecution(
+      WorkflowExecutionHistory history,
+      DataConverter dataConverter,
+      Class<?> workflowClass,
+      Class<?>... moreWorkflowClasses)
+      throws Exception {
+    TestEnvironmentOptions options =
+        new TestEnvironmentOptions.Builder()
+            .setDataConverter(dataConverter)
+            .setWorkflowClientOptions(
+                WorkflowClientOptions.newBuilder().setDataConverter(dataConverter).build())
+            .build();
+    replay(
+        TestWorkflowEnvironment.newInstance(options), history, workflowClass, moreWorkflowClasses);
+  }
+
+  private static void replay(
+      TestWorkflowEnvironment testEnv,
+      WorkflowExecutionHistory history,
+      Class<?> workflowClass,
+      Class<?>... moreWorkflowClasses)
+      throws Exception {
+    try {
+      WorkflowExecutionStartedEventAttributes attr =
+          history.getEvents().get(0).getWorkflowExecutionStartedEventAttributes();
+      TaskList taskList = attr.getTaskList();
+      Worker worker = testEnv.newWorker(taskList.getName());
+      worker.registerWorkflowImplementationTypes(
+          ObjectArrays.concat(moreWorkflowClasses, workflowClass));
+      worker.replayWorkflowExecution(history);
+    } finally {
+      testEnv.close();
+    }
   }
 }

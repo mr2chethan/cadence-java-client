@@ -79,6 +79,7 @@ dependencies {
     compile group: 'com.google.code.gson', name: 'gson', version: '2.10'
     compile group: 'com.fasterxml.jackson.core', name: 'jackson-databind', version: '2.18.2'
     compile group: 'com.fasterxml.jackson.datatype', name: 'jackson-datatype-jsr310', version: '2.18.2'
+    compile group: 'com.fasterxml.jackson.datatype', name: 'jackson-datatype-jdk8', version: '2.18.2'
     compile group: 'com.uber.m3', name: 'tally-core', version: '0.11.1'
     compile group: 'com.google.guava', name: 'guava', version: '31.1-jre'
     compile group: 'com.cronutils', name: 'cron-utils', version: '9.2.0'
@@ -351,6 +352,35 @@ test {
         exceptionFormat 'full'
         // Uncomment the following line if you want to see test logs in gradlew run.
         showStandardStreams false
+    }
+}
+
+// Runs the data converter tests the way JDK 16+ runs them: java.base packages are closed to
+// reflection, except java.lang, which the client itself needs opened (--add-opens).
+task dataConverterStrictEncapsulationTest(type: Test) {
+    description = 'Runs the JacksonDataConverter tests with JDK 16+ strong encapsulation.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    // JDK 8 does not know these flags.
+    onlyIf { JavaVersion.current().isJava9Compatible() }
+    jvmArgs '--illegal-access=deny', '--add-opens', 'java.base/java.lang=ALL-UNNAMED'
+    // JsonDataConverter cannot handle java.time values when java.base/java.time is not opened.
+    systemProperty 'cadence.test.converters', 'jackson'
+    filter {
+        includeTestsMatching 'com.uber.cadence.converter.JacksonDataConverter*Test'
+        includeTestsMatching 'com.uber.cadence.internal.replay.MarkerHandlerDataConverterTest'
+        includeTestsMatching 'com.uber.cadence.internal.common.LocalActivityMarkerDataConverterTest'
+        includeTestsMatching 'com.uber.cadence.common.RetryOptionsDataConverterTest'
+        includeTestsMatching 'com.uber.cadence.internal.shadowing.ReplayWorkflowActivityImplHeartbeatTest'
+        includeTestsMatching 'com.uber.cadence.workflow.DataConverterIntegrationTest'
+        includeTestsMatching 'com.uber.cadence.workflow.DataConverterCustomizationIntegrationTest'
+        includeTestsMatching 'com.uber.cadence.workflow.JacksonMigrationReplayTest'
+        includeTestsMatching 'com.uber.cadence.testing.WorkflowReplayerDataConverterTest'
+    }
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
     }
 }
 

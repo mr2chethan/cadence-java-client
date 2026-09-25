@@ -1,0 +1,584 @@
+[
+  {
+    "eventId": 1,
+    "timestamp": 1790279728883000000,
+    "eventType": "WorkflowExecutionStarted",
+    "version": 0,
+    "taskId": 0,
+    "workflowExecutionStartedEventAttributes": {
+      "workflowType": {
+        "name": "TimeWorkflow::run"
+      },
+      "parentInitiatedEventId": 0,
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "input": "WyJkYXlcdTAwM2QyMDI0LTAyLTI5IGF0XHUwMDNkMjAyMy0xMS0xNFQyMjoxMzoyMC4wMDAwMDAwMDVaIHdoZW5cdTAwM2QxNzAwMDAwMDAwMDAwIGNhbGVuZGFyXHUwMDNkMjAyNC0wMi0yOSAxMDozMDoxNSBub3RlXHUwMDNkT3B0aW9uYWxbaGVsbG9dIG5leHRcdTAwM2QyMDI0LTAzLTAxIGxhdGVyXHUwMDNkMTcwMDAwMDA2MDAwMCB0aW1lb3V0XHUwMDNkUFQxTTMwLjAwMDAwMDAwNVMgc2xvdFx1MDAzZDIwMjQtMDMtMDFUMTA6MzAvUDNEL09wdGlvbmFsSW50WzRdIHNob3V0XHUwMDNkT3B0aW9uYWxbSEVMTE9dIix7InllYXIiOjIwMjQsIm1vbnRoIjoyLCJkYXkiOjI5fSx7InNlY29uZHMiOjE3MDAwMDAwMDAsIm5hbm9zIjo1fSwiTm92IDE0LCAyMDIzLCAxMDoxMzoyMCBQTSIseyJ5ZWFyIjoyMDI0LCJtb250aCI6MSwiZGF5T2ZNb250aCI6MjksImhvdXJPZkRheSI6MTAsIm1pbnV0ZSI6MzAsInNlY29uZCI6MTV9LHsidmFsdWUiOiJoZWxsbyJ9XQ==",
+      "executionStartToCloseTimeoutSeconds": 3600,
+      "taskStartToCloseTimeoutSeconds": 10,
+      "originalExecutionRunId": "745bfd6b-6ca0-4c8e-aaab-2bdc0f080412",
+      "firstScheduledTimeNano": 0,
+      "attempt": 0,
+      "expirationTimestamp": 0,
+      "firstDecisionTaskBackoffSeconds": 0,
+      "partitionConfig": {}
+    }
+  },
+  {
+    "eventId": 2,
+    "timestamp": 1790279728883000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 3,
+    "timestamp": 1790279728885000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 1,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 4,
+    "timestamp": 1790279728945000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 1,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 5,
+    "timestamp": 1790279728945000000,
+    "eventType": "ActivityTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskScheduledEventAttributes": {
+      "activityId": "0",
+      "activityType": {
+        "name": "MigrationActivities::nextDay"
+      },
+      "domain": "default",
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "input": "eyJ5ZWFyIjoyMDI0LCJtb250aCI6MiwiZGF5IjoyOX0=",
+      "scheduleToCloseTimeoutSeconds": 30,
+      "scheduleToStartTimeoutSeconds": 30,
+      "startToCloseTimeoutSeconds": 30,
+      "heartbeatTimeoutSeconds": 30,
+      "decisionTaskCompletedEventId": 3
+    }
+  },
+  {
+    "eventId": 6,
+    "timestamp": 1790279728946000000,
+    "eventType": "ActivityTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskStartedEventAttributes": {
+      "scheduledEventId": 5,
+      "identity": "replay-test",
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 7,
+    "timestamp": 1790279728951000000,
+    "eventType": "ActivityTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskCompletedEventAttributes": {
+      "result": "eyJ5ZWFyIjoyMDI0LCJtb250aCI6MywiZGF5IjoxfQ==",
+      "scheduledEventId": 5,
+      "startedEventId": 6,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 8,
+    "timestamp": 1790279728951000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 9,
+    "timestamp": 1790279728951000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 8,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 10,
+    "timestamp": 1790279728954000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 8,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 11,
+    "timestamp": 1790279728954000000,
+    "eventType": "ActivityTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskScheduledEventAttributes": {
+      "activityId": "1",
+      "activityType": {
+        "name": "MigrationActivities::later"
+      },
+      "domain": "default",
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "input": "Ik5vdiAxNCwgMjAyMywgMTA6MTM6MjAgUE0i",
+      "scheduleToCloseTimeoutSeconds": 30,
+      "scheduleToStartTimeoutSeconds": 30,
+      "startToCloseTimeoutSeconds": 30,
+      "heartbeatTimeoutSeconds": 30,
+      "decisionTaskCompletedEventId": 9
+    }
+  },
+  {
+    "eventId": 12,
+    "timestamp": 1790279728954000000,
+    "eventType": "ActivityTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskStartedEventAttributes": {
+      "scheduledEventId": 11,
+      "identity": "replay-test",
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 13,
+    "timestamp": 1790279728954000000,
+    "eventType": "ActivityTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskCompletedEventAttributes": {
+      "result": "Ik5vdiAxNCwgMjAyMywgMTA6MTQ6MjAgUE0i",
+      "scheduledEventId": 11,
+      "startedEventId": 12,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 14,
+    "timestamp": 1790279728954000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 15,
+    "timestamp": 1790279728954000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 14,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 16,
+    "timestamp": 1790279728956000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 14,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 17,
+    "timestamp": 1790279728956000000,
+    "eventType": "ActivityTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskScheduledEventAttributes": {
+      "activityId": "2",
+      "activityType": {
+        "name": "MigrationActivities::timeout"
+      },
+      "domain": "default",
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "scheduleToCloseTimeoutSeconds": 30,
+      "scheduleToStartTimeoutSeconds": 30,
+      "startToCloseTimeoutSeconds": 30,
+      "heartbeatTimeoutSeconds": 30,
+      "decisionTaskCompletedEventId": 15
+    }
+  },
+  {
+    "eventId": 18,
+    "timestamp": 1790279728956000000,
+    "eventType": "ActivityTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskStartedEventAttributes": {
+      "scheduledEventId": 17,
+      "identity": "replay-test",
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 19,
+    "timestamp": 1790279728956000000,
+    "eventType": "ActivityTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskCompletedEventAttributes": {
+      "result": "eyJzZWNvbmRzIjo5MCwibmFub3MiOjV9",
+      "scheduledEventId": 17,
+      "startedEventId": 18,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 20,
+    "timestamp": 1790279728956000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 21,
+    "timestamp": 1790279728956000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 20,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 22,
+    "timestamp": 1790279728959000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 20,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 23,
+    "timestamp": 1790279728959000000,
+    "eventType": "ActivityTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskScheduledEventAttributes": {
+      "activityId": "3",
+      "activityType": {
+        "name": "MigrationActivities::reschedule"
+      },
+      "domain": "default",
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "input": "eyJzdGFydCI6eyJkYXRlIjp7InllYXIiOjIwMjQsIm1vbnRoIjoyLCJkYXkiOjI5fSwidGltZSI6eyJob3VyIjoxMCwibWludXRlIjozMCwic2Vjb25kIjowLCJuYW5vIjowfX0sImxlbmd0aCI6eyJ5ZWFycyI6MCwibW9udGhzIjowLCJkYXlzIjoyfSwic2VhdHMiOnsiaXNQcmVzZW50Ijp0cnVlLCJ2YWx1ZSI6M319",
+      "scheduleToCloseTimeoutSeconds": 30,
+      "scheduleToStartTimeoutSeconds": 30,
+      "startToCloseTimeoutSeconds": 30,
+      "heartbeatTimeoutSeconds": 30,
+      "decisionTaskCompletedEventId": 21
+    }
+  },
+  {
+    "eventId": 24,
+    "timestamp": 1790279728959000000,
+    "eventType": "ActivityTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskStartedEventAttributes": {
+      "scheduledEventId": 23,
+      "identity": "replay-test",
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 25,
+    "timestamp": 1790279728960000000,
+    "eventType": "ActivityTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskCompletedEventAttributes": {
+      "result": "eyJzdGFydCI6eyJkYXRlIjp7InllYXIiOjIwMjQsIm1vbnRoIjozLCJkYXkiOjF9LCJ0aW1lIjp7ImhvdXIiOjEwLCJtaW51dGUiOjMwLCJzZWNvbmQiOjAsIm5hbm8iOjB9fSwibGVuZ3RoIjp7InllYXJzIjowLCJtb250aHMiOjAsImRheXMiOjN9LCJzZWF0cyI6eyJpc1ByZXNlbnQiOnRydWUsInZhbHVlIjo0fX0=",
+      "scheduledEventId": 23,
+      "startedEventId": 24,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 26,
+    "timestamp": 1790279728960000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 27,
+    "timestamp": 1790279728960000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 26,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 28,
+    "timestamp": 1790279728963000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 26,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 29,
+    "timestamp": 1790279728963000000,
+    "eventType": "ActivityTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskScheduledEventAttributes": {
+      "activityId": "4",
+      "activityType": {
+        "name": "MigrationActivities::shout"
+      },
+      "domain": "default",
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "input": "eyJ2YWx1ZSI6ImhlbGxvIn0=",
+      "scheduleToCloseTimeoutSeconds": 30,
+      "scheduleToStartTimeoutSeconds": 30,
+      "startToCloseTimeoutSeconds": 30,
+      "heartbeatTimeoutSeconds": 30,
+      "decisionTaskCompletedEventId": 27
+    }
+  },
+  {
+    "eventId": 30,
+    "timestamp": 1790279728963000000,
+    "eventType": "ActivityTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskStartedEventAttributes": {
+      "scheduledEventId": 29,
+      "identity": "replay-test",
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 31,
+    "timestamp": 1790279728964000000,
+    "eventType": "ActivityTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskCompletedEventAttributes": {
+      "result": "eyJ2YWx1ZSI6IkhFTExPIn0=",
+      "scheduledEventId": 29,
+      "startedEventId": 30,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 32,
+    "timestamp": 1790279728964000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 33,
+    "timestamp": 1790279728964000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 32,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 34,
+    "timestamp": 1790279728966000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 32,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 35,
+    "timestamp": 1790279728966000000,
+    "eventType": "ActivityTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskScheduledEventAttributes": {
+      "activityId": "5",
+      "activityType": {
+        "name": "MigrationActivities::report"
+      },
+      "domain": "default",
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "input": "ImRheVx1MDAzZDIwMjQtMDItMjkgYXRcdTAwM2QyMDIzLTExLTE0VDIyOjEzOjIwLjAwMDAwMDAwNVogd2hlblx1MDAzZDE3MDAwMDAwMDAwMDAgY2FsZW5kYXJcdTAwM2QyMDI0LTAyLTI5IDEwOjMwOjE1IG5vdGVcdTAwM2RPcHRpb25hbFtoZWxsb10gbmV4dFx1MDAzZDIwMjQtMDMtMDEgbGF0ZXJcdTAwM2QxNzAwMDAwMDYwMDAwIHRpbWVvdXRcdTAwM2RQVDFNMzAuMDAwMDAwMDA1UyBzbG90XHUwMDNkMjAyNC0wMy0wMVQxMDozMC9QM0QvT3B0aW9uYWxJbnRbNF0gc2hvdXRcdTAwM2RPcHRpb25hbFtIRUxMT10i",
+      "scheduleToCloseTimeoutSeconds": 30,
+      "scheduleToStartTimeoutSeconds": 30,
+      "startToCloseTimeoutSeconds": 30,
+      "heartbeatTimeoutSeconds": 30,
+      "decisionTaskCompletedEventId": 33
+    }
+  },
+  {
+    "eventId": 36,
+    "timestamp": 1790279728966000000,
+    "eventType": "ActivityTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskStartedEventAttributes": {
+      "scheduledEventId": 35,
+      "identity": "replay-test",
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 37,
+    "timestamp": 1790279728967000000,
+    "eventType": "ActivityTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "activityTaskCompletedEventAttributes": {
+      "result": "ImRheVx1MDAzZDIwMjQtMDItMjkgYXRcdTAwM2QyMDIzLTExLTE0VDIyOjEzOjIwLjAwMDAwMDAwNVogd2hlblx1MDAzZDE3MDAwMDAwMDAwMDAgY2FsZW5kYXJcdTAwM2QyMDI0LTAyLTI5IDEwOjMwOjE1IG5vdGVcdTAwM2RPcHRpb25hbFtoZWxsb10gbmV4dFx1MDAzZDIwMjQtMDMtMDEgbGF0ZXJcdTAwM2QxNzAwMDAwMDYwMDAwIHRpbWVvdXRcdTAwM2RQVDFNMzAuMDAwMDAwMDA1UyBzbG90XHUwMDNkMjAyNC0wMy0wMVQxMDozMC9QM0QvT3B0aW9uYWxJbnRbNF0gc2hvdXRcdTAwM2RPcHRpb25hbFtIRUxMT10i",
+      "scheduledEventId": 35,
+      "startedEventId": 36,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 38,
+    "timestamp": 1790279728967000000,
+    "eventType": "DecisionTaskScheduled",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskScheduledEventAttributes": {
+      "taskList": {
+        "name": "JacksonMigrationReplayTest"
+      },
+      "startToCloseTimeoutSeconds": 10,
+      "attempt": 0
+    }
+  },
+  {
+    "eventId": 39,
+    "timestamp": 1790279728967000000,
+    "eventType": "DecisionTaskStarted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskStartedEventAttributes": {
+      "scheduledEventId": 38,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 40,
+    "timestamp": 1790279728970000000,
+    "eventType": "DecisionTaskCompleted",
+    "version": 0,
+    "taskId": 0,
+    "decisionTaskCompletedEventAttributes": {
+      "scheduledEventId": 38,
+      "startedEventId": 0,
+      "identity": "replay-test"
+    }
+  },
+  {
+    "eventId": 41,
+    "timestamp": 1790279728970000000,
+    "eventType": "WorkflowExecutionCompleted",
+    "version": 0,
+    "taskId": 0,
+    "workflowExecutionCompletedEventAttributes": {
+      "result": "ImRheVx1MDAzZDIwMjQtMDItMjkgYXRcdTAwM2QyMDIzLTExLTE0VDIyOjEzOjIwLjAwMDAwMDAwNVogd2hlblx1MDAzZDE3MDAwMDAwMDAwMDAgY2FsZW5kYXJcdTAwM2QyMDI0LTAyLTI5IDEwOjMwOjE1IG5vdGVcdTAwM2RPcHRpb25hbFtoZWxsb10gbmV4dFx1MDAzZDIwMjQtMDMtMDEgbGF0ZXJcdTAwM2QxNzAwMDAwMDYwMDAwIHRpbWVvdXRcdTAwM2RQVDFNMzAuMDAwMDAwMDA1UyBzbG90XHUwMDNkMjAyNC0wMy0wMVQxMDozMC9QM0QvT3B0aW9uYWxJbnRbNF0gc2hvdXRcdTAwM2RPcHRpb25hbFtIRUxMT10i",
+      "decisionTaskCompletedEventId": 39
+    }
+  }
+]

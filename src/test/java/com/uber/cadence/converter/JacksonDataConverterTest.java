@@ -19,10 +19,59 @@ package com.uber.cadence.converter;
 
 import static org.junit.Assert.*;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.PropertyAccessor;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.uber.cadence.ActivityType;
+import com.uber.cadence.TimeoutType;
+import com.uber.cadence.WorkflowExecution;
+import com.uber.cadence.WorkflowType;
 import com.uber.cadence.client.ApplicationFailureException;
+import com.uber.cadence.client.WorkflowFailureException;
+import com.uber.cadence.common.RetryOptions;
+import com.uber.cadence.internal.shadowing.ReplayWorkflowActivityParams;
+import com.uber.cadence.internal.shadowing.ReplayWorkflowActivityResult;
+import com.uber.cadence.internal.shadowing.ScanWorkflowActivityParams;
+import com.uber.cadence.internal.shadowing.ScanWorkflowActivityResult;
+import com.uber.cadence.workflow.ActivityFailureException;
+import com.uber.cadence.workflow.ActivityTimeoutException;
+import com.uber.cadence.workflow.ChildWorkflowFailureException;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.NoSuchFileException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -32,13 +81,34 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IllegalFormatConversionException;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.MissingResourceException;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 public class JacksonDataConverterTest {
 
@@ -432,13 +502,6 @@ public class JacksonDataConverterTest {
       this.errorDetail = errorDetail;
     }
 
-    // For deserialization fallback
-    public DetailedException(String message) {
-      super(message);
-      this.errorCode = 0;
-      this.errorDetail = null;
-    }
-
     public int getErrorCode() {
       return errorCode;
     }
@@ -516,5 +579,2108 @@ public class JacksonDataConverterTest {
     assertEquals("outer", fromConverted.getMessage());
     assertNotNull(fromConverted.getCause());
     assertEquals("inner cause", fromConverted.getCause().getMessage());
+  }
+
+  private static byte[] utf8(String json) {
+    return json.getBytes(StandardCharsets.UTF_8);
+  }
+
+  private static String asString(byte[] data) {
+    return new String(data, StandardCharsets.UTF_8);
+  }
+
+  // -------- Empty payloads (JsonDataConverter compatibility) --------
+
+  private static List<byte[]> blankPayloads() {
+    return Arrays.asList(new byte[0], utf8(" \n\t\r"));
+  }
+
+  @Test
+  public void testBlankPayloadDecodesAsNull() {
+    DataConverter json = JsonDataConverter.getInstance();
+    for (byte[] blank : blankPayloads()) {
+      for (DataConverter c : Arrays.asList(converter, json)) {
+        String name = c.getClass().getSimpleName();
+        assertNull(name, c.fromData(blank, String.class, String.class));
+        assertNull(name, c.fromData(blank, Integer.class, Integer.class));
+        assertNull(name, c.fromData(blank, int.class, int.class));
+        assertNull(name, c.fromData(blank, Void.class, Void.class));
+        assertNull(name, c.fromData(blank, SimplePojo.class, SimplePojo.class));
+        assertNull(name, c.fromData(blank, RuntimeException.class, RuntimeException.class));
+      }
+    }
+  }
+
+  @Test
+  public void testBlankPayloadArrayMatchesJsonDataConverter() {
+    Type listOfStrings = new TypeReference<List<String>>() {}.getType();
+    DataConverter json = JsonDataConverter.getInstance();
+    for (byte[] blank : blankPayloads()) {
+      for (DataConverter c : Arrays.asList(converter, json)) {
+        String name = c.getClass().getSimpleName();
+        // Read as a single JSON null: the first argument is null, the others get defaults.
+        assertArrayEquals(
+            name, new Object[] {null, 0}, c.fromDataArray(blank, String.class, int.class));
+        assertArrayEquals(
+            name, new Object[] {null, null}, c.fromDataArray(blank, int.class, String.class));
+        assertArrayEquals(
+            name,
+            new Object[] {null, null, false},
+            c.fromDataArray(blank, String.class, listOfStrings, boolean.class));
+        assertArrayEquals(name, new Object[] {null}, c.fromDataArray(blank, String.class));
+        assertArrayEquals(name, new Object[0], c.fromDataArray(blank));
+      }
+    }
+  }
+
+  @Test
+  public void testJsonNullDecodesAsNullException() {
+    byte[] nullJson = converter.toData((Object) null);
+    assertNull(converter.fromData(nullJson, RuntimeException.class, RuntimeException.class));
+    assertNull(converter.fromData(nullJson, Throwable.class, Throwable.class));
+
+    byte[] data = converter.toData("x", null);
+    assertArrayEquals(
+        new Object[] {"x", null},
+        converter.fromDataArray(data, String.class, RuntimeException.class));
+  }
+
+  // -------- Sets keep the order of the payload --------
+
+  public enum Color {
+    RED,
+    ORANGE,
+    YELLOW,
+    GREEN,
+    BLUE,
+    INDIGO,
+    VIOLET,
+    BLACK
+  }
+
+  /** Has no equals and hashCode, so a HashSet would order its instances by identity hash. */
+  public static class Item {
+    String name;
+
+    public Item() {}
+
+    Item(String name) {
+      this.name = name;
+    }
+  }
+
+  public static class SetHolder {
+    Set<Color> colors;
+    AbstractSet<String> names;
+    SortedSet<String> sorted;
+  }
+
+  public static void setArgument(Set<Color> colors) {}
+
+  private static final String REVERSED_COLORS =
+      "[\"BLACK\",\"VIOLET\",\"INDIGO\",\"BLUE\",\"GREEN\",\"YELLOW\",\"ORANGE\",\"RED\"]";
+
+  private static List<Color> reversedColors() {
+    List<Color> colors = new ArrayList<>(Arrays.asList(Color.values()));
+    Collections.reverse(colors);
+    return colors;
+  }
+
+  @Test
+  public void testSetKeepsPayloadOrder() {
+    Type setOfStrings = new TypeReference<Set<String>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Set<String> strings = converter.fromData(utf8("[\"b\",\"a\",\"c\"]"), Set.class, setOfStrings);
+    assertEquals(LinkedHashSet.class, strings.getClass());
+    assertEquals(Arrays.asList("b", "a", "c"), new ArrayList<>(strings));
+
+    Set<?> raw = converter.fromData(utf8("[\"b\",\"a\"]"), Set.class, Set.class);
+    assertEquals(LinkedHashSet.class, raw.getClass());
+    assertEquals(Arrays.asList("b", "a"), new ArrayList<>(raw));
+  }
+
+  @Test
+  public void testEnumSetKeepsPayloadOrder() {
+    Type setOfColors = new TypeReference<Set<Color>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Set<Color> colors = converter.fromData(utf8(REVERSED_COLORS), Set.class, setOfColors);
+    assertEquals(LinkedHashSet.class, colors.getClass());
+    assertEquals(reversedColors(), new ArrayList<>(colors));
+  }
+
+  @Test
+  public void testSetOfObjectsWithoutHashCodeKeepsPayloadOrder() {
+    Type setOfItems = new TypeReference<Set<Item>>() {}.getType();
+    byte[] data = utf8("[{\"name\":\"c\"},{\"name\":\"a\"},{\"name\":\"d\"},{\"name\":\"b\"}]");
+    @SuppressWarnings("unchecked")
+    Set<Item> items = converter.fromData(data, Set.class, setOfItems);
+    assertEquals(LinkedHashSet.class, items.getClass());
+    List<String> names = new ArrayList<>();
+    for (Item item : items) {
+      names.add(item.name);
+    }
+    assertEquals(Arrays.asList("c", "a", "d", "b"), names);
+  }
+
+  @Test
+  public void testSetFieldsKeepPayloadOrder() {
+    byte[] data =
+        utf8(
+            "{\"colors\":[\"BLUE\",\"RED\",\"GREEN\"],"
+                + "\"names\":[\"z\",\"a\",\"m\"],"
+                + "\"sorted\":[\"z\",\"a\",\"m\"]}");
+    SetHolder holder = converter.fromData(data, SetHolder.class, SetHolder.class);
+    assertEquals(LinkedHashSet.class, holder.colors.getClass());
+    assertEquals(Arrays.asList(Color.BLUE, Color.RED, Color.GREEN), new ArrayList<>(holder.colors));
+    assertEquals(LinkedHashSet.class, holder.names.getClass());
+    assertEquals(Arrays.asList("z", "a", "m"), new ArrayList<>(holder.names));
+    // A sorted set stays sorted.
+    assertEquals(TreeSet.class, holder.sorted.getClass());
+    assertEquals(Arrays.asList("a", "m", "z"), new ArrayList<>(holder.sorted));
+  }
+
+  @Test
+  public void testSetArgumentKeepsPayloadOrder() throws NoSuchMethodException {
+    Method m = JacksonDataConverterTest.class.getDeclaredMethod("setArgument", Set.class);
+    Type arg = m.getGenericParameterTypes()[0];
+    Set<Color> colors = new LinkedHashSet<>(reversedColors());
+
+    Object[] single = converter.fromDataArray(converter.toData(colors), arg);
+    assertEquals(LinkedHashSet.class, single[0].getClass());
+    assertEquals(reversedColors(), new ArrayList<>((Set<?>) single[0]));
+
+    Object[] several = converter.fromDataArray(converter.toData("id", colors), String.class, arg);
+    assertEquals("id", several[0]);
+    assertEquals(reversedColors(), new ArrayList<>((Set<?>) several[1]));
+  }
+
+  @Test
+  public void testSetSerializationIsUnchanged() {
+    Set<String> strings = new LinkedHashSet<>(Arrays.asList("b", "a"));
+    assertEquals("[\"b\",\"a\"]", asString(converter.toData(strings)));
+    assertEquals(
+        REVERSED_COLORS, asString(converter.toData(new LinkedHashSet<>(reversedColors()))));
+  }
+
+  // -------- Classes without a constructor Jackson can use --------
+
+  /** Immutable class with an all-args constructor only. */
+  public static final class ImmutableOrder {
+    static final AtomicInteger constructorCalls = new AtomicInteger();
+
+    private final String id;
+    private final int quantity;
+    private final List<String> items;
+
+    public ImmutableOrder(String id, int quantity, List<String> items) {
+      constructorCalls.incrementAndGet();
+      this.id = id;
+      this.quantity = quantity;
+      this.items = items;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (!(o instanceof ImmutableOrder)) {
+        return false;
+      }
+      ImmutableOrder that = (ImmutableOrder) o;
+      return quantity == that.quantity
+          && Objects.equals(id, that.id)
+          && Objects.equals(items, that.items);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(id, quantity, items);
+    }
+
+    @Override
+    public String toString() {
+      return "ImmutableOrder{" + id + ", " + quantity + ", " + items + "}";
+    }
+  }
+
+  /** Shaped like a Lombok {@code @Value} class: final fields and a package-private constructor. */
+  public static final class ValueStyle {
+    private final String name;
+    private final long amount;
+
+    ValueStyle(String name, long amount) {
+      this.name = name;
+      this.amount = amount;
+    }
+
+    public String getName() {
+      return name;
+    }
+
+    public long getAmount() {
+      return amount;
+    }
+  }
+
+  public static final class PrivateNoArgConstructor {
+    private String name;
+    private String createdBy;
+
+    private PrivateNoArgConstructor() {
+      createdBy = "constructor";
+    }
+  }
+
+  @SuppressWarnings("ClassCanBeStatic")
+  public class InnerValue {
+    private final String label;
+    private final int count;
+
+    public InnerValue(String label, int count) {
+      this.label = label;
+      this.count = count;
+    }
+
+    JacksonDataConverterTest outer() {
+      return JacksonDataConverterTest.this;
+    }
+  }
+
+  public static final class Box<T> {
+    private final T value;
+
+    public Box(T value) {
+      this.value = value;
+    }
+  }
+
+  /** Its only constructor takes a String, which Jackson uses for a JSON string. */
+  public static final class Sku {
+    private final String code;
+
+    public Sku(String code) {
+      this.code = code.toUpperCase(Locale.ROOT);
+    }
+  }
+
+  public static final class ExplicitCreator {
+    private final String value;
+
+    @JsonCreator
+    ExplicitCreator(@JsonProperty("value") String value) {
+      this.value = "created:" + value;
+    }
+  }
+
+  /** A JDK collection subclass without a no-arg constructor. */
+  public static final class TagList extends ArrayList<String> {
+    public TagList(String first) {
+      add(first);
+    }
+  }
+
+  public interface Shape {}
+
+  public abstract static class AbstractShape implements Shape {
+    int sides;
+  }
+
+  private static ImmutableOrder newOrder(String id) {
+    return new ImmutableOrder(id, 2, Arrays.asList("apple", "pear"));
+  }
+
+  @Test
+  public void testClassWithAllArgsConstructorOnly() {
+    ImmutableOrder order = newOrder("o-1");
+    byte[] data = converter.toData(order);
+    int constructorCalls = ImmutableOrder.constructorCalls.get();
+    ImmutableOrder result = converter.fromData(data, ImmutableOrder.class, ImmutableOrder.class);
+    assertEquals(order, result);
+    // Like Gson, the constructor is not run.
+    assertEquals(constructorCalls, ImmutableOrder.constructorCalls.get());
+  }
+
+  @Test
+  public void testValueStyleClass() {
+    byte[] data = converter.toData(new ValueStyle("fee", 12L));
+    ValueStyle result = converter.fromData(data, ValueStyle.class, ValueStyle.class);
+    assertEquals("fee", result.getName());
+    assertEquals(12L, result.getAmount());
+  }
+
+  @Test
+  public void testPrivateNoArgConstructorIsStillUsed() {
+    PrivateNoArgConstructor result =
+        converter.fromData(
+            utf8("{\"name\":\"n\"}"), PrivateNoArgConstructor.class, PrivateNoArgConstructor.class);
+    assertEquals("n", result.name);
+    assertEquals("constructor", result.createdBy);
+  }
+
+  @Test
+  public void testNonStaticInnerClass() {
+    byte[] data = converter.toData(new InnerValue("inner", 3));
+    InnerValue result = converter.fromData(data, InnerValue.class, InnerValue.class);
+    assertEquals("inner", result.label);
+    assertEquals(3, result.count);
+    assertNull(result.outer());
+  }
+
+  @Test
+  public void testGenericClassWithoutNoArgConstructor() {
+    Type type = new TypeReference<Box<ImmutableOrder>>() {}.getType();
+    byte[] data = converter.toData(new Box<>(newOrder("o-2")));
+    @SuppressWarnings("unchecked")
+    Box<ImmutableOrder> result = converter.fromData(data, Box.class, type);
+    assertEquals(newOrder("o-2"), result.value);
+  }
+
+  @Test
+  public void testClassesWithoutNoArgConstructorInContainers() {
+    List<ImmutableOrder> list = Arrays.asList(newOrder("a"), newOrder("b"));
+    Type listType = new TypeReference<List<ImmutableOrder>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    List<ImmutableOrder> listResult =
+        converter.fromData(converter.toData(list), List.class, listType);
+    assertEquals(list, listResult);
+
+    Map<String, ImmutableOrder> map = new HashMap<>();
+    map.put("c", newOrder("c"));
+    Type mapType = new TypeReference<Map<String, ImmutableOrder>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Map<String, ImmutableOrder> mapResult =
+        converter.fromData(converter.toData(map), Map.class, mapType);
+    assertEquals(map, mapResult);
+
+    ImmutableOrder[] array = {newOrder("d")};
+    ImmutableOrder[] arrayResult =
+        converter.fromData(
+            converter.toData((Object) array), ImmutableOrder[].class, ImmutableOrder[].class);
+    assertArrayEquals(array, arrayResult);
+
+    Object[] arguments =
+        converter.fromDataArray(
+            converter.toData("x", newOrder("e")), String.class, ImmutableOrder.class);
+    assertEquals(newOrder("e"), arguments[1]);
+  }
+
+  @Test
+  public void testClassWithStringConstructorOnly() {
+    // A JSON string goes through the constructor.
+    assertEquals("ABC", converter.fromData(utf8("\"abc\""), Sku.class, Sku.class).code);
+    // A JSON object sets the fields without running the constructor.
+    assertEquals("abc", converter.fromData(utf8("{\"code\":\"abc\"}"), Sku.class, Sku.class).code);
+    byte[] data = converter.toData(new Sku("xyz"));
+    assertEquals("XYZ", converter.fromData(data, Sku.class, Sku.class).code);
+  }
+
+  @Test
+  public void testExplicitCreatorIsStillUsed() {
+    ExplicitCreator result =
+        converter.fromData(utf8("{\"value\":\"a\"}"), ExplicitCreator.class, ExplicitCreator.class);
+    assertEquals("created:a", result.value);
+  }
+
+  @Test
+  public void testJdkSubclassWithoutNoArgConstructorIsNotInstantiated() {
+    // Skipping the constructors of a JDK class would leave its internal state uninitialized.
+    assertThrows(
+        DataConverterException.class,
+        () -> converter.fromData(utf8("[\"a\",\"b\"]"), TagList.class, TagList.class));
+  }
+
+  @Test
+  public void testAbstractTypesAreNotInstantiated() {
+    byte[] data = utf8("{\"sides\":3}");
+    assertThrows(
+        DataConverterException.class, () -> converter.fromData(data, Shape.class, Shape.class));
+    assertThrows(
+        DataConverterException.class,
+        () -> converter.fromData(data, AbstractShape.class, AbstractShape.class));
+  }
+
+  // -------- Optional --------
+
+  public static class OptionalHolder {
+    Optional<String> text;
+    Optional<SimplePojo> pojo;
+    OptionalInt count;
+    OptionalLong total;
+    OptionalDouble ratio;
+  }
+
+  @Test
+  public void testOptionalFieldsWithValues() {
+    OptionalHolder holder = new OptionalHolder();
+    holder.text = Optional.of("x");
+    holder.pojo = Optional.of(new SimplePojo("p", 1, Arrays.asList("t")));
+    holder.count = OptionalInt.of(3);
+    holder.total = OptionalLong.of(4L);
+    holder.ratio = OptionalDouble.of(0.5);
+
+    byte[] data = converter.toData(holder);
+    String json = asString(data);
+    // The contained value is written, as if the field were not an Optional.
+    assertTrue(json, json.contains("\"text\":\"x\""));
+    assertTrue(json, json.contains("\"pojo\":{\"name\":\"p\""));
+    assertTrue(json, json.contains("\"count\":3"));
+    assertTrue(json, json.contains("\"total\":4"));
+    assertTrue(json, json.contains("\"ratio\":0.5"));
+
+    OptionalHolder result = converter.fromData(data, OptionalHolder.class, OptionalHolder.class);
+    assertEquals(Optional.of("x"), result.text);
+    assertEquals(holder.pojo, result.pojo);
+    assertEquals(OptionalInt.of(3), result.count);
+    assertEquals(OptionalLong.of(4L), result.total);
+    assertEquals(OptionalDouble.of(0.5), result.ratio);
+  }
+
+  @Test
+  public void testEmptyOptionalFields() {
+    OptionalHolder holder = new OptionalHolder();
+    holder.text = Optional.empty();
+    holder.pojo = Optional.empty();
+    holder.count = OptionalInt.empty();
+    holder.total = OptionalLong.empty();
+    holder.ratio = OptionalDouble.empty();
+
+    byte[] data = converter.toData(holder);
+    assertEquals(
+        "{\"text\":null,\"pojo\":null,\"count\":null,\"total\":null,\"ratio\":null}",
+        asString(data));
+
+    OptionalHolder result = converter.fromData(data, OptionalHolder.class, OptionalHolder.class);
+    assertEquals(Optional.empty(), result.text);
+    assertEquals(Optional.empty(), result.pojo);
+    assertEquals(OptionalInt.empty(), result.count);
+    assertEquals(OptionalLong.empty(), result.total);
+    assertEquals(OptionalDouble.empty(), result.ratio);
+  }
+
+  @Test
+  public void testTopLevelOptional() {
+    Type optionalString = new TypeReference<Optional<String>>() {}.getType();
+    assertEquals("\"x\"", asString(converter.toData(Optional.of("x"))));
+    assertEquals("null", asString(converter.toData(Optional.empty())));
+    assertEquals("3", asString(converter.toData(OptionalInt.of(3))));
+    assertEquals(
+        Optional.of("x"), converter.fromData(utf8("\"x\""), Optional.class, optionalString));
+    assertEquals(
+        Optional.empty(), converter.fromData(utf8("null"), Optional.class, optionalString));
+    assertEquals(
+        OptionalInt.of(3), converter.fromData(utf8("3"), OptionalInt.class, OptionalInt.class));
+
+    Type listOfOptionals = new TypeReference<List<Optional<String>>>() {}.getType();
+    List<Optional<String>> list = Arrays.asList(Optional.of("a"), Optional.empty());
+    byte[] data = converter.toData(list);
+    assertEquals("[\"a\",null]", asString(data));
+    assertEquals(list, converter.fromData(data, List.class, listOfOptionals));
+  }
+
+  // -------- Exceptions keep their exact type, message, fields, cause and suppressed --------
+
+  /** Has neither a (String) nor a no-arg constructor. */
+  public static class OrderFailedException extends RuntimeException {
+    private final int code;
+    private final LocalDate date;
+
+    public OrderFailedException(String message, int code, LocalDate date, Throwable cause) {
+      super(message, cause);
+      this.code = code;
+      this.date = date;
+    }
+
+    public int getCode() {
+      return code;
+    }
+
+    public LocalDate getDate() {
+      return date;
+    }
+  }
+
+  /** Its only constructor formats the message. */
+  public static class OrderNotFoundException extends RuntimeException {
+    private final String orderId;
+
+    public OrderNotFoundException(String orderId) {
+      super("Order not found: " + orderId);
+      this.orderId = orderId;
+    }
+
+    public String getOrderId() {
+      return orderId;
+    }
+  }
+
+  public static class DecoratedMessageException extends RuntimeException {
+    public DecoratedMessageException(String message) {
+      super(message);
+    }
+
+    @Override
+    public String getMessage() {
+      return "[decorated] " + super.getMessage();
+    }
+  }
+
+  public static class OptionalFieldsException extends RuntimeException {
+    private final Optional<String> hint;
+    private final OptionalInt retries;
+    private final OptionalLong limit;
+    private final OptionalDouble ratio;
+
+    public OptionalFieldsException(
+        String message,
+        Optional<String> hint,
+        OptionalInt retries,
+        OptionalLong limit,
+        OptionalDouble ratio) {
+      super(message);
+      this.hint = hint;
+      this.retries = retries;
+      this.limit = limit;
+      this.ratio = ratio;
+    }
+  }
+
+  public static final class ExceptionHolder {
+    private final OrderFailedException failure;
+    private final List<OrderNotFoundException> notFound;
+    private final Exception other;
+
+    public ExceptionHolder(
+        OrderFailedException failure, List<OrderNotFoundException> notFound, Exception other) {
+      this.failure = failure;
+      this.notFound = notFound;
+      this.other = other;
+    }
+  }
+
+  private static final LocalDate ORDER_DATE = LocalDate.of(2025, 4, 15);
+  private static final ActivityType ACTIVITY_TYPE =
+      new ActivityType().setName("Activities::charge");
+  private static final WorkflowExecution EXECUTION =
+      new WorkflowExecution().setWorkflowId("workflow-1").setRunId("run-1");
+
+  /**
+   * Decodes the exception through its own class and through Throwable and checks that both give the
+   * exact class and message. Note that toData clears the cause of the exception it encodes.
+   */
+  private <T extends Throwable> T roundTrip(T exception) {
+    @SuppressWarnings("unchecked")
+    Class<T> type = (Class<T>) exception.getClass();
+    String message = exception.getMessage();
+    byte[] data = converter.toData(exception);
+
+    Throwable asThrowable = converter.fromData(data, Throwable.class, Throwable.class);
+    assertEquals(type, asThrowable.getClass());
+    assertEquals(message, asThrowable.getMessage());
+
+    Throwable result = converter.fromData(data, type, type);
+    assertEquals(type, result.getClass());
+    assertEquals(message, result.getMessage());
+    return type.cast(result);
+  }
+
+  private static void assertSameFrame(StackTraceElement expected, StackTraceElement actual) {
+    assertEquals(expected.getClassName(), actual.getClassName());
+    assertEquals(expected.getMethodName(), actual.getMethodName());
+    assertEquals(expected.getFileName(), actual.getFileName());
+    assertEquals(expected.getLineNumber(), actual.getLineNumber());
+  }
+
+  private static void assertSameStackTrace(Throwable expected, Throwable actual) {
+    assertEquals(expected.getStackTrace().length, actual.getStackTrace().length);
+    assertSameFrame(expected.getStackTrace()[0], actual.getStackTrace()[0]);
+  }
+
+  @Test
+  public void testExceptionWithoutStringOrNoArgConstructor() {
+    IllegalStateException cause = new IllegalStateException("root");
+    OrderFailedException exception = new OrderFailedException("order failed", 7, ORDER_DATE, cause);
+
+    OrderFailedException result = roundTrip(exception);
+    assertEquals(7, result.getCode());
+    assertEquals(ORDER_DATE, result.getDate());
+    assertSameStackTrace(exception, result);
+    assertEquals(IllegalStateException.class, result.getCause().getClass());
+    assertEquals("root", result.getCause().getMessage());
+    assertSameStackTrace(cause, result.getCause());
+  }
+
+  @Test
+  public void testFormattingConstructorDoesNotChangeMessage() {
+    OrderNotFoundException result = roundTrip(new OrderNotFoundException("42"));
+    assertEquals("Order not found: 42", result.getMessage());
+    assertEquals("42", result.getOrderId());
+  }
+
+  @Test
+  public void testNullMessageStaysNull() {
+    IllegalStateException exception = new IllegalStateException((String) null);
+    exception.initCause(new IOException("io"));
+
+    IllegalStateException result = roundTrip(exception);
+    assertNull(result.getMessage());
+    assertEquals("java.lang.IllegalStateException", result.toString());
+    assertEquals(IOException.class, result.getCause().getClass());
+    assertEquals("io", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testOverriddenGetMessageIsNotAppliedTwice() {
+    DecoratedMessageException exception = new DecoratedMessageException("m");
+    byte[] data = converter.toData(exception);
+    assertTrue(asString(data), asString(data).contains("\"detailMessage\":\"m\""));
+
+    DecoratedMessageException result = roundTrip(exception);
+    assertEquals("[decorated] m", result.getMessage());
+  }
+
+  @Test
+  public void testSuppressedExceptionsKeepTheirTypes() {
+    OrderFailedException exception = new OrderFailedException("outer", 1, ORDER_DATE, null);
+    OrderNotFoundException first = new OrderNotFoundException("o-1");
+    IllegalArgumentException second = new IllegalArgumentException("bad argument");
+    exception.addSuppressed(first);
+    exception.addSuppressed(second);
+
+    OrderFailedException result = roundTrip(exception);
+    assertNull(result.getCause());
+    Throwable[] suppressed = result.getSuppressed();
+    assertEquals(2, suppressed.length);
+    assertEquals(OrderNotFoundException.class, suppressed[0].getClass());
+    assertEquals("Order not found: o-1", suppressed[0].getMessage());
+    assertEquals("o-1", ((OrderNotFoundException) suppressed[0]).getOrderId());
+    assertSameStackTrace(first, suppressed[0]);
+    assertEquals(IllegalArgumentException.class, suppressed[1].getClass());
+    assertEquals("bad argument", suppressed[1].getMessage());
+    assertSameStackTrace(second, suppressed[1]);
+  }
+
+  @Test
+  public void testCauseChainKeepsExactTypes() {
+    OrderNotFoundException root = new OrderNotFoundException("o-2");
+    IllegalStateException middle = new IllegalStateException("middle", root);
+    OrderFailedException exception = new OrderFailedException("top", 2, ORDER_DATE, middle);
+
+    OrderFailedException result = roundTrip(exception);
+    Throwable resultMiddle = result.getCause();
+    assertEquals(IllegalStateException.class, resultMiddle.getClass());
+    assertEquals("middle", resultMiddle.getMessage());
+    Throwable resultRoot = resultMiddle.getCause();
+    assertEquals(OrderNotFoundException.class, resultRoot.getClass());
+    assertEquals("Order not found: o-2", resultRoot.getMessage());
+    assertEquals("o-2", ((OrderNotFoundException) resultRoot).getOrderId());
+    assertNull(resultRoot.getCause());
+  }
+
+  @Test
+  public void testUnparseableStackTraceLinesAreSkipped() {
+    String json =
+        "{\"class\":\"java.lang.IllegalStateException\",\"detailMessage\":\"m\","
+            + "\"stackTrace\":\"not a stack frame\\n"
+            + "com.example.Foo.bar(Foo.java:12)\\n"
+            + "\\tat garbage\\n"
+            + "com.example.Foo.baz(Unknown Source)\\n\","
+            + "\"suppressedExceptions\":[]}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, result.getClass());
+    StackTraceElement[] trace = result.getStackTrace();
+    assertEquals(2, trace.length);
+    assertSameFrame(new StackTraceElement("com.example.Foo", "bar", "Foo.java", 12), trace[0]);
+    assertSameFrame(new StackTraceElement("com.example.Foo", "baz", "Unknown Source", 0), trace[1]);
+  }
+
+  @Test
+  public void testActivityFailureException() {
+    OrderNotFoundException cause = new OrderNotFoundException("o-3");
+    ActivityFailureException exception =
+        new ActivityFailureException(
+            5, ACTIVITY_TYPE, "activity-1", cause, 3, Duration.ofSeconds(2));
+
+    ActivityFailureException result = roundTrip(exception);
+    assertEquals(5, result.getEventId());
+    assertEquals(ACTIVITY_TYPE, result.getActivityType());
+    assertEquals("activity-1", result.getActivityId());
+    assertEquals(3, result.getAttempt());
+    assertEquals(Duration.ofSeconds(2), result.getBackoff());
+    assertEquals(OrderNotFoundException.class, result.getCause().getClass());
+    assertEquals("Order not found: o-3", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testActivityTimeoutException() {
+    ActivityTimeoutException exception =
+        new ActivityTimeoutException(
+            6,
+            ACTIVITY_TYPE,
+            "activity-2",
+            TimeoutType.HEARTBEAT,
+            converter.toData("progress"),
+            converter);
+
+    ActivityTimeoutException result = roundTrip(exception);
+    assertEquals(6, result.getEventId());
+    assertEquals(ACTIVITY_TYPE, result.getActivityType());
+    assertEquals("activity-2", result.getActivityId());
+    assertEquals(TimeoutType.HEARTBEAT, result.getTimeoutType());
+    assertEquals("progress", result.getDetails(String.class));
+  }
+
+  @Test
+  public void testChildWorkflowFailureException() {
+    WorkflowType workflowType = new WorkflowType().setName("Child::run");
+    ActivityFailureException cause =
+        new ActivityFailureException(
+            5, ACTIVITY_TYPE, "activity-1", new IllegalStateException("x"));
+    ChildWorkflowFailureException exception =
+        new ChildWorkflowFailureException(7, EXECUTION, workflowType, cause);
+
+    ChildWorkflowFailureException result = roundTrip(exception);
+    assertEquals(7, result.getEventId());
+    assertEquals(EXECUTION, result.getWorkflowExecution());
+    assertEquals(workflowType, result.getWorkflowType());
+    assertEquals(ActivityFailureException.class, result.getCause().getClass());
+    assertEquals(IllegalStateException.class, result.getCause().getCause().getClass());
+  }
+
+  @Test
+  public void testWorkflowFailureException() {
+    WorkflowFailureException exception =
+        new WorkflowFailureException(
+            EXECUTION, Optional.of("Workflow::run"), 9, new OrderNotFoundException("o-4"));
+    WorkflowFailureException result = roundTrip(exception);
+    assertEquals(EXECUTION, result.getExecution());
+    assertEquals(Optional.of("Workflow::run"), result.getWorkflowType());
+    assertEquals(9, result.getDecisionTaskCompletedEventId());
+    assertEquals(OrderNotFoundException.class, result.getCause().getClass());
+
+    WorkflowFailureException withoutType =
+        new WorkflowFailureException(EXECUTION, Optional.empty(), 10, new IllegalStateException());
+    assertEquals(Optional.empty(), roundTrip(withoutType).getWorkflowType());
+  }
+
+  @Test
+  public void testDataConverterException() {
+    DataConverterException exception =
+        new DataConverterException("conversion failed", new IllegalArgumentException("inner"));
+    DataConverterException result = roundTrip(exception);
+    assertEquals(IllegalArgumentException.class, result.getCause().getClass());
+    assertEquals("inner", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testSimulatedTimeoutExceptionInternal() throws Exception {
+    // Package-private in com.uber.cadence.internal.sync. Activities throw it to simulate a timeout
+    // and the workflow side has to recognize its type.
+    Class<? extends Throwable> type =
+        Class.forName("com.uber.cadence.internal.sync.SimulatedTimeoutExceptionInternal")
+            .asSubclass(Throwable.class);
+    Constructor<? extends Throwable> constructor =
+        type.getDeclaredConstructor(TimeoutType.class, byte[].class);
+    constructor.setAccessible(true);
+    Throwable exception =
+        constructor.newInstance(TimeoutType.START_TO_CLOSE, converter.toData("details"));
+
+    Throwable result = roundTrip(exception);
+    assertNull(result.getMessage());
+    Field timeoutType = type.getDeclaredField("timeoutType");
+    timeoutType.setAccessible(true);
+    assertEquals(TimeoutType.START_TO_CLOSE, timeoutType.get(result));
+    Field details = type.getDeclaredField("details");
+    details.setAccessible(true);
+    assertEquals(
+        "details", converter.fromData((byte[]) details.get(result), String.class, String.class));
+  }
+
+  @Test
+  public void testJdkExceptionsKeepTheirTypes() {
+    EnumConstantNotPresentException notPresent =
+        roundTrip(new EnumConstantNotPresentException(Color.class, "PURPLE"));
+    assertEquals(Color.class, notPresent.enumType());
+    assertEquals("PURPLE", notPresent.constantName());
+
+    String json =
+        "{\"class\":\"java.util.MissingResourceException\",\"detailMessage\":\"missing\","
+            + "\"className\":\"Bundle\",\"key\":\"k\",\"suppressedExceptions\":[]}";
+    Throwable missing = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals("missing", missing.getMessage());
+    if (isOpenToReflection(MissingResourceException.class)) {
+      assertEquals(MissingResourceException.class, missing.getClass());
+      assertEquals("Bundle", ((MissingResourceException) missing).getClassName());
+      assertEquals("k", ((MissingResourceException) missing).getKey());
+    } else {
+      // Its fields cannot be restored, and it has no (String) constructor.
+      assertEquals(ApplicationFailureException.class, missing.getClass());
+    }
+  }
+
+  /**
+   * Whether the package of the class is open to this code (not with JDK 16+ strong encapsulation).
+   */
+  private static boolean isOpenToReflection(Class<?> type) {
+    try {
+      type.getDeclaredFields()[0].setAccessible(true);
+      return true;
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
+  @Test
+  public void testJdkExceptionsWithPrivateState() {
+    // With strong encapsulation their fields cannot be restored. They must still have the right
+    // message and cause, and getMessage() must not fail.
+    assertEquals(
+        "d != java.lang.String",
+        decode(new IllegalFormatConversionException('d', String.class)).getMessage());
+
+    Throwable noSuchFile = decode(new NoSuchFileException("/tmp/x"));
+    assertEquals(NoSuchFileException.class, noSuchFile.getClass());
+    assertEquals("/tmp/x", noSuchFile.getMessage());
+
+    Throwable accessDenied = decode(new AccessDeniedException("/etc/shadow", null, "denied"));
+    assertEquals(AccessDeniedException.class, accessDenied.getClass());
+    assertEquals("/etc/shadow: denied", accessDenied.getMessage());
+
+    Throwable invocation = decode(new InvocationTargetException(new IOException("target")));
+    assertEquals(IOException.class, invocation.getCause().getClass());
+    assertEquals("target", invocation.getCause().getMessage());
+  }
+
+  private Throwable decode(Throwable exception) {
+    return converter.fromData(converter.toData(exception), Throwable.class, Throwable.class);
+  }
+
+  public static class BaseCodeException extends RuntimeException {
+    protected final int code;
+
+    BaseCodeException(String message, int code) {
+      super(message);
+      this.code = code;
+    }
+  }
+
+  public static class SubCodeException extends BaseCodeException {
+    // Hides BaseCodeException.code.
+    private final int code;
+
+    SubCodeException(String message, int baseCode, int code) {
+      super(message, baseCode);
+      this.code = code;
+    }
+  }
+
+  @Test
+  public void testHiddenFieldIsNotRestoredFromTheSubclassField() {
+    SubCodeException result = roundTrip(new SubCodeException("hidden", 1, 2));
+    assertEquals(2, result.code);
+  }
+
+  /** Has fields with the names of keys of the JSON of exceptions. */
+  public static class ReservedNamesException extends RuntimeException {
+    private final String cause;
+    private final String stackTrace;
+
+    ReservedNamesException(String message, Throwable cause) {
+      super(message, cause);
+      this.cause = "reserved cause";
+      this.stackTrace = "reserved stack";
+    }
+  }
+
+  @Test
+  public void testFieldsWithReservedNames() {
+    ReservedNamesException result =
+        roundTrip(new ReservedNamesException("reserved", new IOException("real cause")));
+    assertEquals("reserved", result.getMessage());
+    assertEquals(IOException.class, result.getCause().getClass());
+    // These fields cannot be written, so they are not restored from the keys of the exception.
+    assertNull(result.cause);
+    assertNull(result.stackTrace);
+  }
+
+  @Test
+  public void testUnknownExceptionClassBecomesApplicationFailure() {
+    String json =
+        "{\"class\":\"java.lang.IllegalStateException\",\"detailMessage\":\"outer\","
+            + "\"cause\":{\"class\":\"com.example.NoSuchException\",\"detailMessage\":\"lost\"}}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, result.getClass());
+    assertEquals(ApplicationFailureException.class, result.getCause().getClass());
+    assertEquals("lost", result.getCause().getMessage());
+
+    // An abstract class cannot be instantiated either.
+    String abstractJson =
+        "{\"class\":\"com.uber.cadence.workflow.ActivityException\",\"detailMessage\":\"abs\"}";
+    Throwable abstractResult =
+        converter.fromData(utf8(abstractJson), Throwable.class, Throwable.class);
+    assertEquals(ApplicationFailureException.class, abstractResult.getClass());
+    assertEquals("abs", abstractResult.getMessage());
+  }
+
+  @Test
+  public void testInvalidExceptionJsonFails() {
+    List<String> invalid =
+        Arrays.asList(
+            "{\"class\":\"java.lang.String\",\"detailMessage\":\"m\"}",
+            "{\"detailMessage\":\"m\"}",
+            "{\"class\":null,\"detailMessage\":\"m\"}",
+            "\"text\"",
+            "[1]",
+            "42");
+    for (String json : invalid) {
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), RuntimeException.class, RuntimeException.class));
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), Throwable.class, Throwable.class));
+    }
+  }
+
+  @Test
+  public void testExceptionFieldsOfPojo() {
+    ExceptionHolder holder =
+        new ExceptionHolder(
+            new OrderFailedException("failed", 3, ORDER_DATE, new IllegalStateException("c")),
+            Arrays.asList(new OrderNotFoundException("a"), new OrderNotFoundException("b")),
+            new IllegalArgumentException("other"));
+
+    ExceptionHolder result =
+        converter.fromData(converter.toData(holder), ExceptionHolder.class, ExceptionHolder.class);
+    assertEquals(OrderFailedException.class, result.failure.getClass());
+    assertEquals("failed", result.failure.getMessage());
+    assertEquals(3, result.failure.getCode());
+    assertEquals(IllegalStateException.class, result.failure.getCause().getClass());
+    assertEquals(2, result.notFound.size());
+    assertEquals(OrderNotFoundException.class, result.notFound.get(1).getClass());
+    assertEquals("Order not found: b", result.notFound.get(1).getMessage());
+    assertEquals(IllegalArgumentException.class, result.other.getClass());
+    assertEquals("other", result.other.getMessage());
+  }
+
+  @Test
+  public void testExceptionInDataArray() {
+    byte[] data = converter.toData("x", new OrderFailedException("failed", 4, ORDER_DATE, null), 5);
+    Object[] result =
+        converter.fromDataArray(data, String.class, OrderFailedException.class, int.class);
+    assertEquals("x", result[0]);
+    assertEquals(OrderFailedException.class, result[1].getClass());
+    assertEquals(4, ((OrderFailedException) result[1]).getCode());
+    assertEquals(5, result[2]);
+  }
+
+  @Test
+  public void testExceptionOptionalFields() {
+    OptionalFieldsException exception =
+        new OptionalFieldsException(
+            "m",
+            Optional.of("retry later"),
+            OptionalInt.of(2),
+            OptionalLong.of(3L),
+            OptionalDouble.of(0.25));
+    OptionalFieldsException result = roundTrip(exception);
+    assertEquals(Optional.of("retry later"), result.hint);
+    assertEquals(OptionalInt.of(2), result.retries);
+    assertEquals(OptionalLong.of(3L), result.limit);
+    assertEquals(OptionalDouble.of(0.25), result.ratio);
+
+    // Missing, null and invalid values leave an empty Optional rather than null.
+    String className = OptionalFieldsException.class.getName();
+    List<String> jsons =
+        Arrays.asList(
+            "{\"class\":\"" + className + "\",\"detailMessage\":\"m\"}",
+            "{\"class\":\""
+                + className
+                + "\",\"detailMessage\":\"m\","
+                + "\"hint\":null,\"retries\":null,\"limit\":null,\"ratio\":null}",
+            "{\"class\":\""
+                + className
+                + "\",\"detailMessage\":\"m\","
+                + "\"hint\":{\"a\":1},\"retries\":[1],\"limit\":\"x\",\"ratio\":{}}");
+    for (String json : jsons) {
+      OptionalFieldsException empty =
+          converter.fromData(
+              utf8(json), OptionalFieldsException.class, OptionalFieldsException.class);
+      assertEquals(json, "m", empty.getMessage());
+      assertEquals(json, Optional.empty(), empty.hint);
+      assertEquals(json, OptionalInt.empty(), empty.retries);
+      assertEquals(json, OptionalLong.empty(), empty.limit);
+      assertEquals(json, OptionalDouble.empty(), empty.ratio);
+    }
+  }
+
+  @Test
+  public void testExceptionEncodedByJsonDataConverter() {
+    DetailedException exception = new DetailedException("failed", 42, "extra detail");
+    exception.initCause(new IllegalStateException("cause"));
+    byte[] data = JsonDataConverter.getInstance().toData(exception);
+
+    DetailedException result =
+        converter.fromData(data, DetailedException.class, DetailedException.class);
+    assertEquals(DetailedException.class, result.getClass());
+    assertEquals("failed", result.getMessage());
+    assertEquals(42, result.getErrorCode());
+    assertEquals("extra detail", result.getErrorDetail());
+    assertSameStackTrace(exception, result);
+    assertEquals(IllegalStateException.class, result.getCause().getClass());
+    assertEquals("cause", result.getCause().getMessage());
+  }
+
+  @Test
+  public void testActivityFailureExceptionEncodedByJsonDataConverter() {
+    // As JsonDataConverter writes it, with the Duration as seconds and nanos.
+    String json =
+        "{\"attempt\":3,\"backoff\":{\"seconds\":2,\"nanos\":500},"
+            + "\"activityType\":{\"name\":\"Activities::charge\"},\"activityId\":\"1\","
+            + "\"eventId\":5,\"detailMessage\":\"activity failed\","
+            + "\"cause\":{\"detailMessage\":\"boom\","
+            + "\"stackTrace\":\"com.example.Activities.charge(Activities.java:42)\\n\","
+            + "\"suppressedExceptions\":[],\"class\":\"java.lang.IllegalStateException\"},"
+            + "\"stackTrace\":\"com.example.Workflow.run(Workflow.java:7)\\n\","
+            + "\"suppressedExceptions\":[],"
+            + "\"class\":\"com.uber.cadence.workflow.ActivityFailureException\"}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(ActivityFailureException.class, result.getClass());
+    ActivityFailureException failure = (ActivityFailureException) result;
+    assertEquals("activity failed", failure.getMessage());
+    assertEquals(3, failure.getAttempt());
+    assertEquals(Duration.ofSeconds(2, 500), failure.getBackoff());
+    assertEquals(ACTIVITY_TYPE, failure.getActivityType());
+    assertEquals("1", failure.getActivityId());
+    assertEquals(5, failure.getEventId());
+    assertSameFrame(
+        new StackTraceElement("com.example.Workflow", "run", "Workflow.java", 7),
+        failure.getStackTrace()[0]);
+    assertEquals(IllegalStateException.class, failure.getCause().getClass());
+    assertEquals("boom", failure.getCause().getMessage());
+  }
+
+  // -------- Exceptions with a no-arg constructor --------
+
+  /** Its no-arg constructor sets a default message, and its fields have initializers. */
+  public static class InitializedException extends RuntimeException {
+    private final transient List<String> context = new ArrayList<>();
+    private String code = "DEFAULT";
+    private String detail = "initial";
+
+    public InitializedException() {
+      super("default message");
+    }
+
+    InitializedException(String message, String code, String detail) {
+      super(message);
+      this.code = code;
+      this.detail = detail;
+    }
+  }
+
+  @Test
+  public void testNoArgConstructorOfExceptionIsUsed() {
+    InitializedException original = new InitializedException("failed", "E42", "detail");
+    InitializedException result =
+        converter.fromData(
+            converter.toData(original), InitializedException.class, InitializedException.class);
+    assertEquals(InitializedException.class, result.getClass());
+    assertEquals("failed", result.getMessage());
+    assertEquals("E42", result.code);
+    assertEquals("detail", result.detail);
+    // Transient fields are not serialized, and keep the value the constructor gave them.
+    assertEquals(Collections.emptyList(), result.context);
+    assertSameStackTrace(original, result);
+  }
+
+  @Test
+  public void testMissingAndNullFieldsOfExceptionWithNoArgConstructor() {
+    String json =
+        "{\"detailMessage\":null,\"detail\":null,\"stackTrace\":\"\",\"suppressedExceptions\":[],"
+            + "\"class\":\""
+            + InitializedException.class.getName()
+            + "\"}";
+    InitializedException result =
+        converter.fromData(utf8(json), InitializedException.class, InitializedException.class);
+    assertNull(result.getMessage());
+    // A field missing in the JSON keeps its initial value, a null one is set to null.
+    assertEquals("DEFAULT", result.code);
+    assertNull(result.detail);
+    assertNotNull(result.context);
+  }
+
+  /** Its no-arg constructor sets a cause. */
+  public static class PresetCauseException extends RuntimeException {
+    public PresetCauseException() {
+      super("preset", new IllegalArgumentException("preset cause"));
+    }
+
+    PresetCauseException(String message, Throwable cause) {
+      super(message, cause);
+    }
+  }
+
+  @Test
+  public void testCauseSetByNoArgConstructorIsReplaced() {
+    PresetCauseException original =
+        new PresetCauseException("failed", new IOException("actual cause"));
+    PresetCauseException result =
+        converter.fromData(
+            converter.toData(original), PresetCauseException.class, PresetCauseException.class);
+    assertEquals("failed", result.getMessage());
+    assertEquals(IOException.class, result.getCause().getClass());
+    assertEquals("actual cause", result.getCause().getMessage());
+
+    // Without a cause in the JSON, the one set by the constructor is removed.
+    PresetCauseException withoutCause =
+        converter.fromData(
+            converter.toData(new PresetCauseException("no cause", null)),
+            PresetCauseException.class,
+            PresetCauseException.class);
+    assertEquals("no cause", withoutCause.getMessage());
+    assertNull(withoutCause.getCause());
+  }
+
+  // -------- Unusual payloads --------
+
+  @Test
+  public void testExceptionJsonWithoutOptionalParts() {
+    String json =
+        "{\"code\":null,\"cause\":null,"
+            + "\"suppressedExceptions\":[null,{\"class\":\"java.io.IOException\"}],"
+            + "\"class\":\""
+            + OrderFailedException.class.getName()
+            + "\"}";
+    OrderFailedException result =
+        converter.fromData(utf8(json), OrderFailedException.class, OrderFailedException.class);
+    assertNull(result.getMessage());
+    // A primitive field that is null in the JSON keeps its value.
+    assertEquals(0, result.getCode());
+    assertNull(result.getDate());
+    assertNull(result.getCause());
+    assertEquals(0, result.getStackTrace().length);
+    assertEquals(1, result.getSuppressed().length);
+    assertEquals(IOException.class, result.getSuppressed()[0].getClass());
+
+    String withoutSuppressed =
+        "{\"suppressedExceptions\":null,\"class\":\"java.lang.IllegalStateException\"}";
+    Throwable noSuppressed =
+        converter.fromData(utf8(withoutSuppressed), Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, noSuppressed.getClass());
+    assertEquals(0, noSuppressed.getSuppressed().length);
+  }
+
+  @Test
+  public void testExceptionWithoutCauseEncodedByJsonDataConverter() {
+    byte[] data = JsonDataConverter.getInstance().toData(new IllegalStateException("no cause"));
+    Throwable result = converter.fromData(data, Throwable.class, Throwable.class);
+    assertEquals(IllegalStateException.class, result.getClass());
+    assertEquals("no cause", result.getMessage());
+    assertNull(result.getCause());
+  }
+
+  /** Has a synthetic field that references the enclosing instance. */
+  @SuppressWarnings("ClassCanBeStatic")
+  public class InnerException extends RuntimeException {
+    private final int code;
+
+    public InnerException(String message, int code) {
+      super(message);
+      this.code = code;
+    }
+  }
+
+  @Test
+  public void testNonStaticInnerException() {
+    InnerException result =
+        converter.fromData(
+            converter.toData(new InnerException("inner", 3)),
+            InnerException.class,
+            InnerException.class);
+    assertEquals(InnerException.class, result.getClass());
+    assertEquals("inner", result.getMessage());
+    assertEquals(3, result.code);
+  }
+
+  static int failToInitialize() {
+    throw new IllegalStateException("cannot initialize");
+  }
+
+  public static class BrokenClass {
+    static final int VALUE = failToInitialize();
+    final String name;
+
+    BrokenClass(String name) {
+      this.name = name;
+    }
+  }
+
+  public static class BrokenException extends RuntimeException {
+    static final int VALUE = failToInitialize();
+
+    public BrokenException() {}
+
+    public BrokenException(String message) {
+      super(message);
+    }
+  }
+
+  @Test
+  public void testClassesThatFailToInitialize() {
+    assertThrows(
+        DataConverterException.class,
+        () -> converter.fromData(utf8("{\"name\":\"x\"}"), BrokenClass.class, BrokenClass.class));
+
+    String json =
+        "{\"detailMessage\":\"broken\",\"class\":\"" + BrokenException.class.getName() + "\"}";
+    Throwable result = converter.fromData(utf8(json), Throwable.class, Throwable.class);
+    assertEquals(ApplicationFailureException.class, result.getClass());
+    assertEquals("broken", result.getMessage());
+  }
+
+  public static class Tags {
+    final List<String> values;
+    final boolean fromCreator;
+
+    private Tags(List<String> values) {
+      this.values = values;
+      this.fromCreator = true;
+    }
+
+    @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+    public static Tags of(List<String> values) {
+      return new Tags(values);
+    }
+  }
+
+  public static class Attributes {
+    final Map<String, String> values;
+    final boolean fromCreator;
+
+    @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+    public Attributes(Map<String, String> values) {
+      this.values = values;
+      this.fromCreator = true;
+    }
+  }
+
+  @Test
+  public void testDelegatingCreatorsAreStillUsed() {
+    Tags tags = converter.fromData(utf8("[\"a\",\"b\"]"), Tags.class, Tags.class);
+    assertTrue(tags.fromCreator);
+    assertEquals(Arrays.asList("a", "b"), tags.values);
+
+    Attributes attributes =
+        converter.fromData(utf8("{\"k\":\"v\"}"), Attributes.class, Attributes.class);
+    assertTrue(attributes.fromCreator);
+    assertEquals(Collections.singletonMap("k", "v"), attributes.values);
+  }
+
+  public static class ConverterAndClass {
+    DataConverter converter;
+    Class<?> type;
+  }
+
+  @Test
+  public void testDataConverterAndClassFields() {
+    ConverterAndClass holder =
+        converter.fromData(
+            utf8(
+                "{\"converter\":{\"type\":\"JSON\"},\"type\":{\"className\":\"java.lang.String\"}}"),
+            ConverterAndClass.class,
+            ConverterAndClass.class);
+    assertSame(JacksonDataConverter.getInstance(), holder.converter);
+    assertEquals(String.class, holder.type);
+
+    for (String json :
+        Arrays.asList(
+            "{\"converter\":{}}",
+            "{\"converter\":{\"type\":\"XML\"}}",
+            "{\"type\":{}}",
+            "{\"type\":{\"className\":\"com.example.Missing\"}}")) {
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), ConverterAndClass.class, ConverterAndClass.class));
+    }
+  }
+
+  public static class SelfReference {
+    final SelfReference self = this;
+  }
+
+  @Test
+  public void testValueThatCannotBeSerialized() {
+    assertThrows(DataConverterException.class, () -> converter.toData(new SelfReference()));
+  }
+
+  // -------- Duration in the format of JsonDataConverter --------
+
+  public static class DurationHolder {
+    Duration plain;
+
+    @JsonFormat(pattern = "MILLIS")
+    Duration millis;
+  }
+
+  @Test
+  public void testDurationInJsonDataConverterFormat() {
+    Duration expected = Duration.ofSeconds(5, 7);
+    assertEquals(
+        expected,
+        converter.fromData(utf8("{\"seconds\":5,\"nanos\":7}"), Duration.class, Duration.class));
+    assertEquals(
+        Duration.ofSeconds(5),
+        converter.fromData(utf8("{\"seconds\":5}"), Duration.class, Duration.class));
+    // The format Jackson writes, and ISO-8601, are still read.
+    assertEquals("5.000000007", asString(converter.toData(expected)));
+    assertEquals(expected, converter.fromData(utf8("5.000000007"), Duration.class, Duration.class));
+    assertEquals(
+        Duration.ofSeconds(5),
+        converter.fromData(utf8("\"PT5S\""), Duration.class, Duration.class));
+  }
+
+  @Test
+  public void testDurationFieldsInJsonDataConverterFormat() {
+    DurationHolder holder =
+        converter.fromData(
+            utf8("{\"plain\":{\"seconds\":2,\"nanos\":5},\"millis\":{\"seconds\":3,\"nanos\":0}}"),
+            DurationHolder.class,
+            DurationHolder.class);
+    assertEquals(Duration.ofSeconds(2, 5), holder.plain);
+    assertEquals(Duration.ofSeconds(3), holder.millis);
+
+    // Annotations on the field still apply to the other formats.
+    DurationHolder annotated =
+        converter.fromData(
+            utf8("{\"plain\":1.5,\"millis\":1500}"), DurationHolder.class, DurationHolder.class);
+    assertEquals(Duration.ofMillis(1500), annotated.plain);
+    assertEquals(Duration.ofMillis(1500), annotated.millis);
+  }
+
+  @Test
+  public void testInvalidDurationObjectFails() {
+    for (String json :
+        Arrays.asList(
+            "{\"foo\":1}",
+            "{\"seconds\":\"5\"}",
+            "{}",
+            "{\"seconds\":1.9}",
+            "{\"seconds\":1,\"nanos\":\"x\"}",
+            "{\"seconds\":1,\"nanos\":0.5}",
+            "{\"seconds\":99999999999999999999}")) {
+      assertThrows(
+          json,
+          DataConverterException.class,
+          () -> converter.fromData(utf8(json), Duration.class, Duration.class));
+    }
+  }
+
+  // -------- Customized ObjectMapper --------
+
+  @Test
+  public void testCustomizedMapperKeepsCadenceHandling() {
+    List<Function<ObjectMapper, ObjectMapper>> interceptors =
+        Arrays.asList(
+            mapper -> mapper,
+            ObjectMapper::copy,
+            mapper -> mapper.copy().registerModule(new SimpleModule("application-module")));
+    for (Function<ObjectMapper, ObjectMapper> interceptor : interceptors) {
+      DataConverter custom = new JacksonDataConverter(interceptor);
+
+      ImmutableOrder order = newOrder("custom");
+      assertEquals(
+          order, custom.fromData(custom.toData(order), ImmutableOrder.class, ImmutableOrder.class));
+
+      byte[] exception = custom.toData(new OrderFailedException("custom", 8, ORDER_DATE, null));
+      Throwable result = custom.fromData(exception, Throwable.class, Throwable.class);
+      assertEquals(OrderFailedException.class, result.getClass());
+      assertEquals("custom", result.getMessage());
+      assertEquals(8, ((OrderFailedException) result).getCode());
+
+      Type setOfColors = new TypeReference<Set<Color>>() {}.getType();
+      @SuppressWarnings("unchecked")
+      Set<Color> colors = custom.fromData(utf8(REVERSED_COLORS), Set.class, setOfColors);
+      assertEquals(reversedColors(), new ArrayList<>(colors));
+
+      assertEquals(
+          Duration.ofSeconds(1),
+          custom.fromData(utf8("{\"seconds\":1,\"nanos\":0}"), Duration.class, Duration.class));
+      assertNull(custom.fromData(new byte[0], String.class, String.class));
+    }
+  }
+
+  // -------- The mapper interceptor and the data the client records for itself --------
+
+  /**
+   * Returns a converter whose ObjectMapper is configured in place the way an application may
+   * configure its own mapper: snake_case names, getters instead of fields, failing on unknown
+   * properties, dates as timestamps and Durations as ISO-8601 strings. None of it applies to the
+   * data the client records for itself, such as marker headers and RetryOptions.
+   */
+  public static DataConverter newCustomizedConverter() {
+    return new JacksonDataConverter(
+        mapper -> {
+          mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+          mapper.setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE);
+          mapper.setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.PUBLIC_ONLY);
+          mapper.enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+          mapper.enable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+          return mapper.registerModule(isoDurationModule());
+        });
+  }
+
+  /** Writes and reads Durations as ISO-8601 strings only, such as "PT1M30S". */
+  private static SimpleModule isoDurationModule() {
+    SimpleModule module = new SimpleModule("iso-durations");
+    module.addSerializer(
+        Duration.class,
+        new JsonSerializer<Duration>() {
+          @Override
+          public void serialize(Duration value, JsonGenerator gen, SerializerProvider provider)
+              throws IOException {
+            gen.writeString(value.toString());
+          }
+        });
+    module.addDeserializer(
+        Duration.class,
+        new JsonDeserializer<Duration>() {
+          @Override
+          public Duration deserialize(JsonParser p, DeserializationContext ctxt)
+              throws IOException {
+            return Duration.parse(p.getValueAsString());
+          }
+        });
+    return module;
+  }
+
+  /**
+   * Runs the action and returns what it logged, in this thread, with the logger of the messages
+   * about the differences between JacksonDataConverter and JsonDataConverter.
+   */
+  public static List<ILoggingEvent> compatibilityLogOf(Runnable action) {
+    Logger logger =
+        (Logger)
+            LoggerFactory.getLogger(JacksonDataConverter.class.getName() + ".GsonCompatibility");
+    ListAppender<ILoggingEvent> appender = new ListAppender<>();
+    appender.start();
+    Level level = logger.getLevel();
+    boolean additive = logger.isAdditive();
+    logger.setLevel(Level.ALL);
+    logger.setAdditive(false);
+    logger.addAppender(appender);
+    try {
+      action.run();
+    } finally {
+      logger.detachAppender(appender);
+      logger.setAdditive(additive);
+      logger.setLevel(level);
+    }
+    String thread = Thread.currentThread().getName();
+    return appender
+        .list
+        .stream()
+        .filter(event -> thread.equals(event.getThreadName()))
+        .collect(Collectors.toList());
+  }
+
+  private static final String INTERCEPTOR_MESSAGE =
+      "mapperInterceptor must return the ObjectMapper it was given, or a copy() of it";
+
+  /** {@link #fullRetryOptions()} as JsonDataConverter writes them. */
+  private static final String RETRY_OPTIONS_JSON =
+      "{\"initialInterval\":{\"seconds\":1,\"nanos\":0},\"backoffCoefficient\":1.5,"
+          + "\"expiration\":{\"seconds\":300,\"nanos\":0},\"maximumAttempts\":4,"
+          + "\"maximumInterval\":{\"seconds\":10,\"nanos\":500000000},"
+          + "\"doNotRetry\":[{\"className\":\"java.lang.IllegalStateException\"}]}";
+
+  /** {@link #fullRetryOptions()} written with snake_case names. */
+  private static final String RETRY_OPTIONS_SNAKE_CASE_JSON =
+      "{\"initial_interval\":{\"seconds\":1,\"nanos\":0},\"backoff_coefficient\":1.5,"
+          + "\"expiration\":{\"seconds\":300,\"nanos\":0},\"maximum_attempts\":4,"
+          + "\"maximum_interval\":{\"seconds\":10,\"nanos\":500000000},"
+          + "\"do_not_retry\":[{\"className\":\"java.lang.IllegalStateException\"}]}";
+
+  private static RetryOptions fullRetryOptions() {
+    return new RetryOptions.Builder()
+        .setInitialInterval(Duration.ofSeconds(1))
+        .setExpiration(Duration.ofMinutes(5))
+        .setMaximumInterval(Duration.ofMillis(10500))
+        .setBackoffCoefficient(1.5)
+        .setMaximumAttempts(4)
+        .setDoNotRetry(IllegalStateException.class)
+        .validateBuildWithDefaults();
+  }
+
+  private static DataConverter newSnakeCaseConverter() {
+    return new JacksonDataConverter(
+        mapper -> mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE));
+  }
+
+  /** Has no no-arg constructor, and public getters. */
+  public static final class CustomerRecord {
+    private final String customerId;
+    private final LocalDate since;
+
+    public CustomerRecord(String customerId, LocalDate since) {
+      this.customerId = customerId;
+      this.since = since;
+    }
+
+    public String getCustomerId() {
+      return customerId;
+    }
+
+    public LocalDate getSince() {
+      return since;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (!(o instanceof CustomerRecord)) {
+        return false;
+      }
+      CustomerRecord that = (CustomerRecord) o;
+      return Objects.equals(customerId, that.customerId) && Objects.equals(since, that.since);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(customerId, since);
+    }
+  }
+
+  @Test
+  public void testInterceptorMustReturnGivenMapperOrCopy() {
+    List<Function<ObjectMapper, ObjectMapper>> rejected =
+        Arrays.asList(
+            mapper -> new ObjectMapper(), mapper -> JsonMapper.builder().build(), mapper -> null);
+    for (Function<ObjectMapper, ObjectMapper> interceptor : rejected) {
+      IllegalArgumentException e =
+          assertThrows(IllegalArgumentException.class, () -> new JacksonDataConverter(interceptor));
+      assertTrue(e.getMessage(), e.getMessage().startsWith(INTERCEPTOR_MESSAGE));
+    }
+
+    SimplePojo pojo = new SimplePojo("Ann", 41, Arrays.asList("admin"));
+    List<Function<ObjectMapper, ObjectMapper>> accepted =
+        Arrays.asList(mapper -> mapper, ObjectMapper::copy);
+    for (Function<ObjectMapper, ObjectMapper> interceptor : accepted) {
+      DataConverter custom = new JacksonDataConverter(interceptor);
+      assertEquals(pojo, custom.fromData(custom.toData(pojo), SimplePojo.class, SimplePojo.class));
+    }
+  }
+
+  @Test
+  public void testMapperChangesAfterConstructionHaveNoEffect() throws Exception {
+    AtomicReference<ObjectMapper> kept = new AtomicReference<>();
+    DataConverter custom =
+        new JacksonDataConverter(
+            mapper -> {
+              kept.set(mapper);
+              return mapper;
+            });
+    CustomerRecord record = new CustomerRecord("c-1", ORDER_DATE);
+    OrderFailedException exception = new OrderFailedException("failed", 4, ORDER_DATE, null);
+    String recordJson = asString(custom.toData(record));
+    String exceptionJson = asString(custom.toData(exception));
+    assertEquals("{\"customerId\":\"c-1\",\"since\":\"2025-04-15\"}", recordJson);
+
+    ObjectMapper mapper = kept.get();
+    mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+    mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.NONE);
+    mapper.setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.PUBLIC_ONLY);
+    mapper.enable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    mapper.enable(SerializationFeature.INDENT_OUTPUT);
+    assertNotEquals(recordJson, mapper.writeValueAsString(record));
+
+    assertEquals(recordJson, asString(custom.toData(record)));
+    assertEquals(exceptionJson, asString(custom.toData(exception)));
+    assertEquals(
+        record, custom.fromData(utf8(recordJson), CustomerRecord.class, CustomerRecord.class));
+    OrderFailedException decoded =
+        custom.fromData(
+            utf8(exceptionJson), OrderFailedException.class, OrderFailedException.class);
+    assertEquals(4, decoded.getCode());
+    assertEquals(ORDER_DATE, decoded.getDate());
+  }
+
+  @Test
+  public void testUserModulesTakePrecedenceForUserValues() {
+    SimpleModule module = isoDurationModule();
+    module.addAbstractTypeMapping(Set.class, TreeSet.class);
+    DataConverter custom = new JacksonDataConverter(mapper -> mapper.registerModule(module));
+
+    Type setOfStrings = new TypeReference<Set<String>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Set<String> strings = custom.fromData(utf8("[\"c\",\"a\",\"b\"]"), Set.class, setOfStrings);
+    assertEquals(TreeSet.class, strings.getClass());
+    assertEquals(Arrays.asList("a", "b", "c"), new ArrayList<>(strings));
+
+    assertEquals("\"PT1M30S\"", asString(custom.toData(Duration.ofSeconds(90))));
+    assertEquals(
+        Duration.ofSeconds(90),
+        custom.fromData(utf8("\"PT1M30S\""), Duration.class, Duration.class));
+
+    // Not the Durations of RetryOptions, which JsonDataConverter has to be able to read.
+    RetryOptions options = fullRetryOptions();
+    byte[] data = custom.toData(options);
+    assertEquals(RETRY_OPTIONS_JSON, asString(data));
+    assertEquals(options, custom.fromData(data, RetryOptions.class, RetryOptions.class));
+  }
+
+  @Test
+  public void testClientPayloadsIgnoreCustomization() {
+    DataConverter custom = newCustomizedConverter();
+    // The customization applies to the values of the application.
+    assertEquals("\"PT1M30S\"", asString(custom.toData(Duration.ofSeconds(90))));
+    assertEquals(
+        "{\"customer_id\":\"c-1\",\"since\":[2025,4,15]}",
+        asString(custom.toData(new CustomerRecord("c-1", ORDER_DATE))));
+
+    RetryOptions options = fullRetryOptions();
+    byte[] data = custom.toData(options);
+    assertEquals(RETRY_OPTIONS_JSON, asString(data));
+    assertEquals(options, custom.fromData(data, RetryOptions.class, RetryOptions.class));
+    assertEquals(options, custom.fromDataArray(data, RetryOptions.class)[0]);
+    assertEquals(
+        options, custom.fromData(utf8(RETRY_OPTIONS_JSON), RetryOptions.class, RetryOptions.class));
+
+    // The parameters of the shadowing activity, which a worker of another language writes, with
+    // properties this version does not know. Those of the values of the application are logged.
+    String unknown = "unknown" + UUID.randomUUID().toString().replace("-", "");
+    List<Object[]> arguments = new ArrayList<>();
+    List<ILoggingEvent> logged =
+        compatibilityLogOf(
+            () -> {
+              arguments.add(
+                  custom.fromDataArray(
+                      utf8(
+                          "{\"domain\":\"d\",\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\","
+                              + "\"extra\":1}],\"extra\":{}}"),
+                      ReplayWorkflowActivityParams.class));
+              converter.fromData(
+                  utf8("{\"name\":\"n\",\"" + unknown + "\":1}"), Item.class, Item.class);
+            });
+    assertEquals(1, logged.size());
+    assertEquals(Level.WARN, logged.get(0).getLevel());
+    assertTrue(
+        logged.get(0).getFormattedMessage(),
+        logged.get(0).getFormattedMessage().contains(unknown)
+            && logged.get(0).getFormattedMessage().contains(Item.class.getName()));
+    ReplayWorkflowActivityParams params = (ReplayWorkflowActivityParams) arguments.get(0)[0];
+    assertEquals("d", params.getDomain());
+    assertEquals("w", params.getExecutions().get(0).getWorkflowId());
+    assertEquals("r", params.getExecutions().get(0).getRunId());
+
+    ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
+    result.setSucceeded(3);
+    result.setSkipped(1);
+    result.setFailed(2);
+    assertEquals("{\"succeeded\":3,\"skipped\":1,\"failed\":2}", asString(custom.toData(result)));
+  }
+
+  private static Object newInstance(String className, Class<?>[] parameterTypes, Object... args)
+      throws ReflectiveOperationException {
+    Constructor<?> constructor = Class.forName(className).getDeclaredConstructor(parameterTypes);
+    constructor.setAccessible(true);
+    return constructor.newInstance(args);
+  }
+
+  /**
+   * Every type of data the client records for itself with the configured converter is written and
+   * read with the default configuration, whatever the configuration of the converter.
+   */
+  @Test
+  public void testClientPayloadClassesAreRoutedAndGsonShaped() throws Exception {
+    String localActivityHeader =
+        "com.uber.cadence.internal.common.LocalActivityMarkerData$LocalActivityMarkerHeader";
+    ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
+    result.setSucceeded(3);
+    result.setSkipped(1);
+    result.setFailed(2);
+    com.uber.cadence.internal.shadowing.WorkflowExecution execution =
+        new com.uber.cadence.internal.shadowing.WorkflowExecution("w", "r");
+    ReplayWorkflowActivityParams params = new ReplayWorkflowActivityParams();
+    params.setDomain("d");
+    params.setExecutions(Collections.singletonList(execution));
+    ScanWorkflowActivityParams scanParams = new ScanWorkflowActivityParams();
+    scanParams.setDomain("d");
+    scanParams.setWorkflowQuery("q");
+    scanParams.setSamplingRate(0.5);
+    scanParams.setPageSize(10);
+    scanParams.setNextPageToken(new byte[] {1, 2});
+    ScanWorkflowActivityResult scanResult = new ScanWorkflowActivityResult();
+    scanResult.setExecutions(Collections.singletonList(execution));
+
+    Map<Object, String> payloads = new LinkedHashMap<>();
+    payloads.put(
+        newInstance(
+            "com.uber.cadence.internal.replay.MarkerHandler$MarkerData$MarkerHeader",
+            new Class<?>[] {String.class, long.class, int.class},
+            "v-1",
+            5L,
+            2),
+        "{\"id\":\"v-1\",\"eventId\":5,\"accessCount\":2}");
+    payloads.put(
+        newInstance(
+            "com.uber.cadence.internal.replay.MarkerHandler$PlainMarkerData",
+            new Class<?>[] {String.class, long.class, byte[].class, int.class},
+            "p-1",
+            3L,
+            new byte[] {1, 2},
+            1),
+        "{\"id\":\"p-1\",\"eventId\":3,\"data\":\"AQI=\",\"accessCount\":1}");
+    payloads.put(
+        newInstance(
+            localActivityHeader,
+            new Class<?>[] {
+              String.class,
+              String.class,
+              long.class,
+              String.class,
+              int.class,
+              Duration.class,
+              boolean.class
+            },
+            "la-1",
+            "Activity::run",
+            99L,
+            null,
+            2,
+            Duration.ofMillis(15500),
+            false),
+        "{\"activityId\":\"la-1\",\"activityType\":\"Activity::run\",\"errReason\":null,"
+            + "\"replayTimeMillis\":99,\"attempt\":2,"
+            + "\"backoff\":{\"seconds\":15,\"nanos\":500000000},\"isCancelled\":false}");
+    payloads.put(
+        newInstance(
+            "com.uber.cadence.internal.shadowing.ReplayWorkflowActivityImpl$HeartbeatDetail",
+            new Class<?>[] {ReplayWorkflowActivityResult.class, int.class},
+            result,
+            7),
+        "{\"replayResult\":{\"succeeded\":3,\"skipped\":1,\"failed\":2},"
+            + "\"replayExecutionIndex\":7}");
+    payloads.put(
+        params, "{\"domain\":\"d\",\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\"}]}");
+    payloads.put(result, "{\"succeeded\":3,\"skipped\":1,\"failed\":2}");
+    payloads.put(execution, "{\"workflowId\":\"w\",\"runId\":\"r\"}");
+    payloads.put(
+        scanParams,
+        "{\"domain\":\"d\",\"workflowQuery\":\"q\",\"samplingRate\":0.5,\"pageSize\":10,"
+            + "\"nextPageToken\":\"AQI=\"}");
+    payloads.put(
+        scanResult,
+        "{\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\"}],\"nextPageToken\":null}");
+    payloads.put(fullRetryOptions(), RETRY_OPTIONS_JSON);
+
+    Set<String> withGsonShapedDurations =
+        new HashSet<>(Arrays.asList(localActivityHeader, RetryOptions.class.getName()));
+    DataConverter custom = newCustomizedConverter();
+    for (Map.Entry<Object, String> payload : payloads.entrySet()) {
+      Class<?> type = payload.getKey().getClass();
+      String json = payload.getValue();
+      assertTrue(type.getName(), ClientPayloads.isClientPayload(type));
+      assertEquals(
+          type.getName(),
+          withGsonShapedDurations.contains(type.getName()),
+          ClientPayloads.hasGsonShapedDurations(type));
+      assertEquals(json, asString(converter.toData(payload.getKey())));
+      assertEquals(json, asString(custom.toData(payload.getKey())));
+      Object decoded = custom.fromData(utf8(json), type, type);
+      assertEquals(type, decoded.getClass());
+      assertEquals(json, asString(converter.toData(decoded)));
+    }
+
+    // Exceptions are values of the application, even the client's own.
+    for (String exception :
+        Arrays.asList(
+            "com.uber.cadence.internal.shadowing.NonRetryableException",
+            "com.uber.cadence.internal.sync.SimulatedTimeoutExceptionInternal",
+            "com.uber.cadence.internal.replay.ActivityTaskFailedException")) {
+      Class<?> type = Class.forName(exception);
+      assertFalse(exception, ClientPayloads.isClientPayload(type));
+      assertFalse(exception, ClientPayloads.hasGsonShapedDurations(type));
+    }
+    for (Class<?> type :
+        Arrays.asList(SimplePojo.class, WorkflowExecution.class, String.class, Duration.class)) {
+      assertFalse(type.getName(), ClientPayloads.isClientPayload(type));
+      assertFalse(type.getName(), ClientPayloads.hasGsonShapedDurations(type));
+    }
+  }
+
+  public static final class GsonTreeHolder {
+    JsonElement tree;
+    JsonArray array;
+  }
+
+  @Test
+  public void testExceptionsWithDefaultTyping() {
+    DataConverter typed =
+        new JacksonDataConverter(
+            mapper ->
+                mapper.activateDefaultTyping(
+                    LaissezFaireSubTypeValidator.instance, ObjectMapper.DefaultTyping.NON_FINAL));
+
+    // toData clears the cause of the exception it encodes, so it is encoded once.
+    byte[] data =
+        typed.toData(
+            new OrderFailedException("typed", 3, ORDER_DATE, new OrderNotFoundException("o-9")));
+    for (Class<? extends Throwable> type :
+        Arrays.asList(Throwable.class, RuntimeException.class, OrderFailedException.class)) {
+      Throwable result = typed.fromData(data, type, type);
+      assertEquals(OrderFailedException.class, result.getClass());
+      assertEquals("typed", result.getMessage());
+      assertEquals(3, ((OrderFailedException) result).getCode());
+      assertEquals(ORDER_DATE, ((OrderFailedException) result).getDate());
+      assertEquals(OrderNotFoundException.class, result.getCause().getClass());
+      assertEquals("o-9", ((OrderNotFoundException) result.getCause()).getOrderId());
+    }
+
+    ActivityTimeoutException timeout =
+        new ActivityTimeoutException(
+            6, ACTIVITY_TYPE, "activity-2", TimeoutType.HEARTBEAT, typed.toData("progress"), typed);
+    ActivityTimeoutException decodedTimeout =
+        typed.fromData(
+            typed.toData(timeout), ActivityTimeoutException.class, ActivityTimeoutException.class);
+    assertEquals(ACTIVITY_TYPE, decodedTimeout.getActivityType());
+    assertEquals(TimeoutType.HEARTBEAT, decodedTimeout.getTimeoutType());
+    assertEquals("progress", decodedTimeout.getDetails(String.class));
+
+    GsonTreeHolder holder = new GsonTreeHolder();
+    JsonObject tree = new JsonObject();
+    tree.addProperty("n", 1);
+    tree.addProperty("s", "x");
+    holder.tree = tree;
+    holder.array = new JsonArray();
+    holder.array.add(2.5);
+    String holderJson = asString(typed.toData(holder));
+    assertTrue(holderJson, holderJson.contains("\"tree\":{\"n\":1,\"s\":\"x\"},\"array\":[2.5]"));
+    GsonTreeHolder decodedHolder =
+        typed.fromData(utf8(holderJson), GsonTreeHolder.class, GsonTreeHolder.class);
+    assertEquals(tree, decodedHolder.tree);
+    assertEquals(holder.array, decodedHolder.array);
+
+    ConverterAndClass withConverter = new ConverterAndClass();
+    withConverter.converter = typed;
+    withConverter.type = String.class;
+    ConverterAndClass decodedWithConverter =
+        typed.fromData(
+            typed.toData(withConverter), ConverterAndClass.class, ConverterAndClass.class);
+    assertSame(JacksonDataConverter.getInstance(), decodedWithConverter.converter);
+    assertEquals(String.class, decodedWithConverter.type);
+  }
+
+  @Test
+  public void testSeveralValuesWithRetryOptionsUseConfiguredMapper() {
+    DataConverter snakeCase = newSnakeCaseConverter();
+    RetryOptions options = fullRetryOptions();
+
+    byte[] data = snakeCase.toData(options, "x");
+    assertEquals("[" + RETRY_OPTIONS_SNAKE_CASE_JSON + ",\"x\"]", asString(data));
+    assertArrayEquals(
+        new Object[] {options, "x"},
+        snakeCase.fromDataArray(data, RetryOptions.class, String.class));
+
+    // A single value is written as JsonDataConverter writes it.
+    assertEquals(RETRY_OPTIONS_JSON, asString(snakeCase.toData(options)));
+  }
+
+  /** Holds data of the client in a value of the application. */
+  public static final class RetryPolicy {
+    RetryOptions options;
+    Duration timeout;
+  }
+
+  /**
+   * The Durations of RetryOptions inside values of the application are read in the form they are
+   * written in, also when the application reads Durations only in another form.
+   */
+  @Test
+  public void testRetryOptionsInValuesWithApplicationDurationDeserializer() {
+    DataConverter custom =
+        new JacksonDataConverter(mapper -> mapper.registerModule(isoDurationModule()));
+    RetryOptions options = fullRetryOptions();
+
+    byte[] data = custom.toData(options, "x");
+    assertEquals("[" + RETRY_OPTIONS_JSON + ",\"x\"]", asString(data));
+    assertArrayEquals(
+        new Object[] {options, "x"}, custom.fromDataArray(data, RetryOptions.class, String.class));
+
+    RetryPolicy policy = new RetryPolicy();
+    policy.options = options;
+    policy.timeout = Duration.ofSeconds(90);
+    byte[] policyData = custom.toData(policy);
+    assertEquals(
+        "{\"options\":" + RETRY_OPTIONS_JSON + ",\"timeout\":\"PT1M30S\"}", asString(policyData));
+    RetryPolicy decoded = custom.fromData(policyData, RetryPolicy.class, RetryPolicy.class);
+    assertEquals(options, decoded.options);
+    assertEquals(Duration.ofSeconds(90), decoded.timeout);
+  }
+
+  /** The array of the values is not typed, only the values in it. */
+  @Test
+  public void testSeveralValuesWithDefaultTyping() {
+    DataConverter typed =
+        new JacksonDataConverter(
+            mapper ->
+                mapper.activateDefaultTyping(
+                    LaissezFaireSubTypeValidator.instance, ObjectMapper.DefaultTyping.NON_FINAL));
+    SimplePojo pojo = new SimplePojo("Ann", 41, Arrays.asList("admin"));
+    RetryOptions options = fullRetryOptions();
+
+    byte[] data = typed.toData("a", 1, pojo, options);
+    String json = asString(data);
+    assertTrue(json, json.startsWith("[\"a\",1,[\"" + SimplePojo.class.getName() + "\","));
+    assertArrayEquals(
+        new Object[] {"a", 1, pojo, options},
+        typed.fromDataArray(
+            data, String.class, Integer.class, SimplePojo.class, RetryOptions.class));
+  }
+
+  public static final class MaybeHolder {
+    final Optional<String> maybe;
+
+    @JsonCreator
+    MaybeHolder(@JsonProperty("maybe") Optional<String> maybe) {
+      this.maybe = maybe;
+    }
+  }
+
+  /** A JavaTimeModule or Jdk8Module that the application registers applies to its values. */
+  @Test
+  public void testApplicationJavaTimeAndJdk8ModulesApply() {
+    JavaTimeModule javaTime = new JavaTimeModule();
+    javaTime.addSerializer(
+        LocalDate.class,
+        new JsonSerializer<LocalDate>() {
+          @Override
+          public void serialize(LocalDate value, JsonGenerator gen, SerializerProvider provider)
+              throws IOException {
+            gen.writeString("CUSTOM-" + value);
+          }
+        });
+    javaTime.addSerializer(
+        Duration.class,
+        new JsonSerializer<Duration>() {
+          @Override
+          public void serialize(Duration value, JsonGenerator gen, SerializerProvider provider)
+              throws IOException {
+            gen.writeNumber(value.toMillis());
+          }
+        });
+    DataConverter custom =
+        new JacksonDataConverter(
+            mapper ->
+                mapper
+                    .registerModule(javaTime)
+                    .registerModule(new Jdk8Module().configureReadAbsentAsNull(true)));
+
+    assertEquals("\"CUSTOM-2025-04-15\"", asString(custom.toData(ORDER_DATE)));
+    assertEquals("90000", asString(custom.toData(Duration.ofSeconds(90))));
+    // A missing Optional is null rather than empty.
+    assertNull(custom.fromData(utf8("{}"), MaybeHolder.class, MaybeHolder.class).maybe);
+    assertEquals(
+        Optional.empty(),
+        converter.fromData(utf8("{}"), MaybeHolder.class, MaybeHolder.class).maybe);
+
+    // Not to the data of the client.
+    RetryOptions options = fullRetryOptions();
+    assertEquals(RETRY_OPTIONS_JSON, asString(custom.toData(options)));
+    byte[] data = custom.toData(options, "x");
+    assertEquals("[" + RETRY_OPTIONS_JSON + ",\"x\"]", asString(data));
+    assertArrayEquals(
+        new Object[] {options, "x"}, custom.fromDataArray(data, RetryOptions.class, String.class));
+  }
+
+  @Test
+  public void testMapperForGenericTypes() {
+    DataConverter snakeCase = newSnakeCaseConverter();
+    List<RetryOptions> list = Collections.singletonList(fullRetryOptions());
+    Type listOfOptions = new TypeReference<List<RetryOptions>>() {}.getType();
+
+    // The value is a List, so the configured mapper writes and reads it.
+    byte[] data = snakeCase.toData(list);
+    assertEquals("[" + RETRY_OPTIONS_SNAKE_CASE_JSON + "]", asString(data));
+    assertEquals(list, snakeCase.fromData(data, List.class, listOfOptions));
+    assertEquals(list, snakeCase.fromDataArray(data, listOfOptions)[0]);
+
+    RetryOptions[] array = {fullRetryOptions()};
+    assertEquals(asString(data), asString(snakeCase.toData((Object) array)));
+    assertArrayEquals(array, snakeCase.fromData(data, RetryOptions[].class, RetryOptions[].class));
+  }
+
+  /** Loads the classes of the converter package anew, so that they are initialized again. */
+  private static final class FreshConverterClassLoader extends ClassLoader {
+    private static final String PACKAGE_PREFIX =
+        JacksonDataConverter.class.getPackage().getName() + ".";
+
+    FreshConverterClassLoader() {
+      super(JacksonDataConverterTest.class.getClassLoader());
+    }
+
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+      if (!name.startsWith(PACKAGE_PREFIX)) {
+        return super.loadClass(name, resolve);
+      }
+      synchronized (getClassLoadingLock(name)) {
+        Class<?> type = findLoadedClass(name);
+        if (type == null) {
+          byte[] bytes = readClassFile(name);
+          type = defineClass(name, bytes, 0, bytes.length);
+        }
+        if (resolve) {
+          resolveClass(type);
+        }
+        return type;
+      }
+    }
+
+    private byte[] readClassFile(String name) throws ClassNotFoundException {
+      try (InputStream in = getParent().getResourceAsStream(name.replace('.', '/') + ".class")) {
+        if (in == null) {
+          throw new ClassNotFoundException(name);
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        for (int n = in.read(buffer); n >= 0; n = in.read(buffer)) {
+          out.write(buffer, 0, n);
+        }
+        return out.toByteArray();
+      } catch (IOException e) {
+        throw new ClassNotFoundException(name, e);
+      }
+    }
+  }
+
+  /**
+   * The singleton and the converters are usable whichever of them is used first, as the singleton
+   * is created only after all the static fields of the converter are initialized.
+   */
+  @Test
+  public void testGetInstanceIsSingletonAfterStaticInit() throws Exception {
+    RetryOptions options = fullRetryOptions();
+    for (boolean singletonFirst : new boolean[] {true, false}) {
+      Class<?> type =
+          Class.forName(
+              JacksonDataConverter.class.getName(), false, new FreshConverterClassLoader());
+      assertNotSame(JacksonDataConverter.class, type);
+      Method getInstance = type.getMethod("getInstance");
+      Object custom = null;
+      if (!singletonFirst) {
+        custom = type.getConstructor(Function.class).newInstance(Function.identity());
+      }
+      Object instance = getInstance.invoke(null);
+      assertSame(type, instance.getClass());
+      assertSame(instance, getInstance.invoke(null));
+
+      Method toData = type.getMethod("toData", Object[].class);
+      Method fromData = type.getMethod("fromData", byte[].class, Class.class, Type.class);
+      for (Object c : singletonFirst ? Arrays.asList(instance) : Arrays.asList(custom, instance)) {
+        byte[] data = (byte[]) toData.invoke(c, new Object[] {new Object[] {options}});
+        assertEquals(RETRY_OPTIONS_JSON, asString(data));
+        assertEquals(options, fromData.invoke(c, data, RetryOptions.class, RetryOptions.class));
+      }
+    }
   }
 }
