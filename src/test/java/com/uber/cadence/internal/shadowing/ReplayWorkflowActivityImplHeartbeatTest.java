@@ -17,6 +17,7 @@
 
 package com.uber.cadence.internal.shadowing;
 
+import static com.uber.cadence.converter.JacksonDataConverterTest.newCustomizedConverter;
 import static org.junit.Assert.assertEquals;
 
 import com.google.common.base.Splitter;
@@ -29,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.UUID;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -63,6 +65,7 @@ public class ReplayWorkflowActivityImplHeartbeatTest {
           break;
         case "jackson":
           result.add(new Object[] {name, JacksonDataConverter.getInstance()});
+          result.add(new Object[] {"jackson-customized", newCustomizedConverter()});
           break;
         default:
           throw new IllegalArgumentException("Unknown converter: " + name);
@@ -96,6 +99,54 @@ public class ReplayWorkflowActivityImplHeartbeatTest {
         converter.fromData(DETAILS.getBytes(StandardCharsets.UTF_8), detailClass, detailClass);
 
     assertProgress(decoded);
+  }
+
+  /** Details with properties this version does not know, as a newer client writes. */
+  @Test
+  public void testUnknownPropertiesOfHeartbeatDetailAreIgnored() throws Exception {
+    String unknown = "unknown" + UUID.randomUUID().toString().replace("-", "");
+    Class<?> detailClass = heartbeatDetailClass();
+    byte[] details =
+        ("{\"replayResult\":{\"succeeded\":3,\"skipped\":1,\"failed\":2,\""
+                + unknown
+                + "\":0},\"replayExecutionIndex\":7,\""
+                + unknown
+                + "\":\"x\"}")
+            .getBytes(StandardCharsets.UTF_8);
+
+    assertProgress(converter.fromData(details, detailClass, detailClass));
+  }
+
+  /**
+   * The shadowing workflow, which the Cadence server runs, passes the parameters of the activity
+   * and reads its result.
+   */
+  @Test
+  public void testActivityParametersWrittenByShadowingWorkflow() {
+    String unknown = "unknown" + UUID.randomUUID().toString().replace("-", "");
+    byte[] input =
+        ("{\"domain\":\"samples\",\"executions\":[{\"workflowId\":\"w-1\",\"runId\":\"r-1\",\""
+                + unknown
+                + "\":1}],\""
+                + unknown
+                + "\":{\"a\":[]}}")
+            .getBytes(StandardCharsets.UTF_8);
+
+    ReplayWorkflowActivityParams params =
+        (ReplayWorkflowActivityParams)
+            converter.fromDataArray(input, ReplayWorkflowActivityParams.class)[0];
+    assertEquals("samples", params.getDomain());
+    assertEquals(1, params.getExecutions().size());
+    assertEquals("w-1", params.getExecutions().get(0).getWorkflowId());
+    assertEquals("r-1", params.getExecutions().get(0).getRunId());
+
+    ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
+    result.setSucceeded(3);
+    result.setSkipped(1);
+    result.setFailed(2);
+    assertEquals(
+        "{\"succeeded\":3,\"skipped\":1,\"failed\":2}",
+        new String(converter.toData(result), StandardCharsets.UTF_8));
   }
 
   private static Class<?> heartbeatDetailClass() throws ClassNotFoundException {

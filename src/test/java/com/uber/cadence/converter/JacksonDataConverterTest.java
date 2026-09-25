@@ -19,13 +19,23 @@ package com.uber.cadence.converter;
 
 import static org.junit.Assert.*;
 
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -35,10 +45,17 @@ import com.uber.cadence.WorkflowExecution;
 import com.uber.cadence.WorkflowType;
 import com.uber.cadence.client.ApplicationFailureException;
 import com.uber.cadence.client.WorkflowFailureException;
+import com.uber.cadence.common.RetryOptions;
+import com.uber.cadence.internal.shadowing.ReplayWorkflowActivityParams;
+import com.uber.cadence.internal.shadowing.ReplayWorkflowActivityResult;
+import com.uber.cadence.internal.shadowing.ScanWorkflowActivityParams;
+import com.uber.cadence.internal.shadowing.ScanWorkflowActivityResult;
 import com.uber.cadence.workflow.ActivityFailureException;
 import com.uber.cadence.workflow.ActivityTimeoutException;
 import com.uber.cadence.workflow.ChildWorkflowFailureException;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -62,6 +79,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.IllegalFormatConversionException;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -77,6 +95,7 @@ import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import org.junit.Test;
 
@@ -1886,6 +1905,392 @@ public class JacksonDataConverterTest {
     }
   }
 
+  // -------- The mapper interceptor and the data the client records for itself --------
+
+  /**
+   * Returns a converter whose ObjectMapper is configured in place the way an application may
+   * configure its own mapper: snake_case names, getters instead of fields, failing on unknown
+   * properties, dates as timestamps and Durations as ISO-8601 strings. None of it applies to the
+   * data the client records for itself, such as marker headers and RetryOptions.
+   */
+  public static DataConverter newCustomizedConverter() {
+    return new JacksonDataConverter(
+        mapper -> {
+          mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+          mapper.setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE);
+          mapper.setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.PUBLIC_ONLY);
+          mapper.enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+          mapper.enable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+          return mapper.registerModule(isoDurationModule());
+        });
+  }
+
+  /** Writes and reads Durations as ISO-8601 strings only, such as "PT1M30S". */
+  private static SimpleModule isoDurationModule() {
+    SimpleModule module = new SimpleModule("iso-durations");
+    module.addSerializer(
+        Duration.class,
+        new JsonSerializer<Duration>() {
+          @Override
+          public void serialize(Duration value, JsonGenerator gen, SerializerProvider provider)
+              throws IOException {
+            gen.writeString(value.toString());
+          }
+        });
+    module.addDeserializer(
+        Duration.class,
+        new JsonDeserializer<Duration>() {
+          @Override
+          public Duration deserialize(JsonParser p, DeserializationContext ctxt)
+              throws IOException {
+            return Duration.parse(p.getValueAsString());
+          }
+        });
+    return module;
+  }
+
+  private static final String INTERCEPTOR_MESSAGE =
+      "mapperInterceptor must return the ObjectMapper it was given, or a copy() of it";
+
+  private static RetryOptions fullRetryOptions() {
+    return new RetryOptions.Builder()
+        .setInitialInterval(Duration.ofSeconds(1))
+        .setExpiration(Duration.ofMinutes(5))
+        .setMaximumInterval(Duration.ofMillis(10500))
+        .setBackoffCoefficient(1.5)
+        .setMaximumAttempts(4)
+        .setDoNotRetry(IllegalStateException.class)
+        .validateBuildWithDefaults();
+  }
+
+  private static DataConverter newSnakeCaseConverter() {
+    return new JacksonDataConverter(
+        mapper -> mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE));
+  }
+
+  /** Has no no-arg constructor, and public getters. */
+  public static final class CustomerRecord {
+    private final String customerId;
+    private final LocalDate since;
+
+    public CustomerRecord(String customerId, LocalDate since) {
+      this.customerId = customerId;
+      this.since = since;
+    }
+
+    public String getCustomerId() {
+      return customerId;
+    }
+
+    public LocalDate getSince() {
+      return since;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (!(o instanceof CustomerRecord)) {
+        return false;
+      }
+      CustomerRecord that = (CustomerRecord) o;
+      return Objects.equals(customerId, that.customerId) && Objects.equals(since, that.since);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(customerId, since);
+    }
+  }
+
+  @Test
+  public void testInterceptorMustReturnGivenMapperOrCopy() {
+    List<Function<ObjectMapper, ObjectMapper>> rejected =
+        Arrays.asList(
+            mapper -> new ObjectMapper(), mapper -> JsonMapper.builder().build(), mapper -> null);
+    for (Function<ObjectMapper, ObjectMapper> interceptor : rejected) {
+      IllegalArgumentException e =
+          assertThrows(IllegalArgumentException.class, () -> new JacksonDataConverter(interceptor));
+      assertTrue(e.getMessage(), e.getMessage().startsWith(INTERCEPTOR_MESSAGE));
+    }
+
+    SimplePojo pojo = new SimplePojo("Ann", 41, Arrays.asList("admin"));
+    List<Function<ObjectMapper, ObjectMapper>> accepted =
+        Arrays.asList(mapper -> mapper, ObjectMapper::copy);
+    for (Function<ObjectMapper, ObjectMapper> interceptor : accepted) {
+      DataConverter custom = new JacksonDataConverter(interceptor);
+      assertEquals(pojo, custom.fromData(custom.toData(pojo), SimplePojo.class, SimplePojo.class));
+    }
+  }
+
+  @Test
+  public void testMapperChangesAfterConstructionHaveNoEffect() throws Exception {
+    AtomicReference<ObjectMapper> kept = new AtomicReference<>();
+    DataConverter custom =
+        new JacksonDataConverter(
+            mapper -> {
+              kept.set(mapper);
+              return mapper;
+            });
+    CustomerRecord record = new CustomerRecord("c-1", ORDER_DATE);
+    OrderFailedException exception = new OrderFailedException("failed", 4, ORDER_DATE, null);
+    String recordJson = asString(custom.toData(record));
+    String exceptionJson = asString(custom.toData(exception));
+    assertEquals("{\"customerId\":\"c-1\",\"since\":\"2025-04-15\"}", recordJson);
+
+    ObjectMapper mapper = kept.get();
+    mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+    mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.NONE);
+    mapper.setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.PUBLIC_ONLY);
+    mapper.enable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    mapper.enable(SerializationFeature.INDENT_OUTPUT);
+    assertNotEquals(recordJson, mapper.writeValueAsString(record));
+
+    assertEquals(recordJson, asString(custom.toData(record)));
+    assertEquals(exceptionJson, asString(custom.toData(exception)));
+    assertEquals(
+        record, custom.fromData(utf8(recordJson), CustomerRecord.class, CustomerRecord.class));
+    OrderFailedException decoded =
+        custom.fromData(
+            utf8(exceptionJson), OrderFailedException.class, OrderFailedException.class);
+    assertEquals(4, decoded.getCode());
+    assertEquals(ORDER_DATE, decoded.getDate());
+  }
+
+  @Test
+  public void testUserModulesTakePrecedenceForUserValues() {
+    SimpleModule module = isoDurationModule();
+    module.addAbstractTypeMapping(Set.class, TreeSet.class);
+    DataConverter custom = new JacksonDataConverter(mapper -> mapper.registerModule(module));
+
+    Type setOfStrings = new TypeReference<Set<String>>() {}.getType();
+    @SuppressWarnings("unchecked")
+    Set<String> strings = custom.fromData(utf8("[\"c\",\"a\",\"b\"]"), Set.class, setOfStrings);
+    assertEquals(TreeSet.class, strings.getClass());
+    assertEquals(Arrays.asList("a", "b", "c"), new ArrayList<>(strings));
+
+    assertEquals("\"PT1M30S\"", asString(custom.toData(Duration.ofSeconds(90))));
+    assertEquals(
+        Duration.ofSeconds(90),
+        custom.fromData(utf8("\"PT1M30S\""), Duration.class, Duration.class));
+
+    RetryOptions options = fullRetryOptions();
+    byte[] data = custom.toData(options);
+    assertEquals(options, custom.fromData(data, RetryOptions.class, RetryOptions.class));
+  }
+
+  @Test
+  public void testClientPayloadsIgnoreCustomization() {
+    DataConverter custom = newCustomizedConverter();
+    // The customization applies to the values of the application.
+    assertEquals("\"PT1M30S\"", asString(custom.toData(Duration.ofSeconds(90))));
+    assertEquals(
+        "{\"customer_id\":\"c-1\",\"since\":[2025,4,15]}",
+        asString(custom.toData(new CustomerRecord("c-1", ORDER_DATE))));
+
+    RetryOptions options = fullRetryOptions();
+    byte[] data = custom.toData(options);
+    assertEquals(options, custom.fromData(data, RetryOptions.class, RetryOptions.class));
+    assertEquals(options, custom.fromDataArray(data, RetryOptions.class)[0]);
+
+    ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
+    result.setSucceeded(3);
+    result.setSkipped(1);
+    result.setFailed(2);
+    assertEquals("{\"succeeded\":3,\"skipped\":1,\"failed\":2}", asString(custom.toData(result)));
+  }
+
+  /**
+   * The parameters of the shadowing activity, which a worker of another language writes, with
+   * properties this version does not know.
+   */
+  @Test
+  public void testUnknownPropertiesOfClientPayloadsIgnoreCustomization() {
+    String unknown = "unknown" + UUID.randomUUID().toString().replace("-", "");
+    Object[] arguments =
+        newCustomizedConverter()
+            .fromDataArray(
+                utf8(
+                    "{\"domain\":\"d\",\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\",\""
+                        + unknown
+                        + "\":1}],\""
+                        + unknown
+                        + "\":{}}"),
+                ReplayWorkflowActivityParams.class);
+    ReplayWorkflowActivityParams params = (ReplayWorkflowActivityParams) arguments[0];
+    assertEquals("d", params.getDomain());
+    assertEquals("w", params.getExecutions().get(0).getWorkflowId());
+    assertEquals("r", params.getExecutions().get(0).getRunId());
+  }
+
+  private static Object newInstance(String className, Class<?>[] parameterTypes, Object... args)
+      throws ReflectiveOperationException {
+    Constructor<?> constructor = Class.forName(className).getDeclaredConstructor(parameterTypes);
+    constructor.setAccessible(true);
+    return constructor.newInstance(args);
+  }
+
+  /**
+   * Every type of data the client records for itself with the configured converter is written and
+   * read with the default configuration, whatever the configuration of the converter.
+   */
+  @Test
+  public void testClientPayloadClasses() throws Exception {
+    ReplayWorkflowActivityResult result = new ReplayWorkflowActivityResult();
+    result.setSucceeded(3);
+    result.setSkipped(1);
+    result.setFailed(2);
+    com.uber.cadence.internal.shadowing.WorkflowExecution execution =
+        new com.uber.cadence.internal.shadowing.WorkflowExecution("w", "r");
+    ReplayWorkflowActivityParams params = new ReplayWorkflowActivityParams();
+    params.setDomain("d");
+    params.setExecutions(Collections.singletonList(execution));
+    ScanWorkflowActivityParams scanParams = new ScanWorkflowActivityParams();
+    scanParams.setDomain("d");
+    scanParams.setWorkflowQuery("q");
+    scanParams.setSamplingRate(0.5);
+    scanParams.setPageSize(10);
+    scanParams.setNextPageToken(new byte[] {1, 2});
+    ScanWorkflowActivityResult scanResult = new ScanWorkflowActivityResult();
+    scanResult.setExecutions(Collections.singletonList(execution));
+
+    Map<Object, String> payloads = new LinkedHashMap<>();
+    payloads.put(
+        newInstance(
+            "com.uber.cadence.internal.replay.MarkerHandler$MarkerData$MarkerHeader",
+            new Class<?>[] {String.class, long.class, int.class},
+            "v-1",
+            5L,
+            2),
+        "{\"id\":\"v-1\",\"eventId\":5,\"accessCount\":2}");
+    payloads.put(
+        newInstance(
+            "com.uber.cadence.internal.replay.MarkerHandler$PlainMarkerData",
+            new Class<?>[] {String.class, long.class, byte[].class, int.class},
+            "p-1",
+            3L,
+            new byte[] {1, 2},
+            1),
+        "{\"id\":\"p-1\",\"eventId\":3,\"data\":\"AQI=\",\"accessCount\":1}");
+    payloads.put(
+        newInstance(
+            "com.uber.cadence.internal.shadowing.ReplayWorkflowActivityImpl$HeartbeatDetail",
+            new Class<?>[] {ReplayWorkflowActivityResult.class, int.class},
+            result,
+            7),
+        "{\"replayResult\":{\"succeeded\":3,\"skipped\":1,\"failed\":2},"
+            + "\"replayExecutionIndex\":7}");
+    payloads.put(
+        params, "{\"domain\":\"d\",\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\"}]}");
+    payloads.put(result, "{\"succeeded\":3,\"skipped\":1,\"failed\":2}");
+    payloads.put(execution, "{\"workflowId\":\"w\",\"runId\":\"r\"}");
+    payloads.put(
+        scanParams,
+        "{\"domain\":\"d\",\"workflowQuery\":\"q\",\"samplingRate\":0.5,\"pageSize\":10,"
+            + "\"nextPageToken\":\"AQI=\"}");
+    payloads.put(
+        scanResult,
+        "{\"executions\":[{\"workflowId\":\"w\",\"runId\":\"r\"}],\"nextPageToken\":null}");
+
+    DataConverter custom = newCustomizedConverter();
+    for (Map.Entry<Object, String> payload : payloads.entrySet()) {
+      Class<?> type = payload.getKey().getClass();
+      String json = payload.getValue();
+      assertTrue(type.getName(), ClientPayloads.isClientPayload(type));
+      assertEquals(json, asString(converter.toData(payload.getKey())));
+      assertEquals(json, asString(custom.toData(payload.getKey())));
+      Object decoded = custom.fromData(utf8(json), type, type);
+      assertEquals(type, decoded.getClass());
+      assertEquals(json, asString(converter.toData(decoded)));
+    }
+
+    // Exceptions are values of the application, even the client's own.
+    for (String exception :
+        Arrays.asList(
+            "com.uber.cadence.internal.shadowing.NonRetryableException",
+            "com.uber.cadence.internal.sync.SimulatedTimeoutExceptionInternal",
+            "com.uber.cadence.internal.replay.ActivityTaskFailedException")) {
+      Class<?> type = Class.forName(exception);
+      assertFalse(exception, ClientPayloads.isClientPayload(type));
+    }
+    for (Class<?> type :
+        Arrays.asList(SimplePojo.class, WorkflowExecution.class, String.class, Duration.class)) {
+      assertFalse(type.getName(), ClientPayloads.isClientPayload(type));
+    }
+  }
+
+  @Test
+  public void testExceptionsWithDefaultTyping() {
+    DataConverter typed =
+        new JacksonDataConverter(
+            mapper ->
+                mapper.activateDefaultTyping(
+                    LaissezFaireSubTypeValidator.instance, ObjectMapper.DefaultTyping.NON_FINAL));
+
+    // toData clears the cause of the exception it encodes, so it is encoded once.
+    byte[] data =
+        typed.toData(
+            new OrderFailedException("typed", 3, ORDER_DATE, new OrderNotFoundException("o-9")));
+    for (Class<? extends Throwable> type :
+        Arrays.asList(Throwable.class, RuntimeException.class, OrderFailedException.class)) {
+      Throwable result = typed.fromData(data, type, type);
+      assertEquals(OrderFailedException.class, result.getClass());
+      assertEquals("typed", result.getMessage());
+      assertEquals(3, ((OrderFailedException) result).getCode());
+      assertEquals(ORDER_DATE, ((OrderFailedException) result).getDate());
+      assertEquals(OrderNotFoundException.class, result.getCause().getClass());
+      assertEquals("o-9", ((OrderNotFoundException) result.getCause()).getOrderId());
+    }
+
+    ActivityTimeoutException timeout =
+        new ActivityTimeoutException(
+            6, ACTIVITY_TYPE, "activity-2", TimeoutType.HEARTBEAT, typed.toData("progress"), typed);
+    ActivityTimeoutException decodedTimeout =
+        typed.fromData(
+            typed.toData(timeout), ActivityTimeoutException.class, ActivityTimeoutException.class);
+    assertEquals(ACTIVITY_TYPE, decodedTimeout.getActivityType());
+    assertEquals(TimeoutType.HEARTBEAT, decodedTimeout.getTimeoutType());
+    assertEquals("progress", decodedTimeout.getDetails(String.class));
+
+    ConverterAndClass withConverter = new ConverterAndClass();
+    withConverter.converter = typed;
+    withConverter.type = String.class;
+    ConverterAndClass decodedWithConverter =
+        typed.fromData(
+            typed.toData(withConverter), ConverterAndClass.class, ConverterAndClass.class);
+    assertSame(JacksonDataConverter.getInstance(), decodedWithConverter.converter);
+    assertEquals(String.class, decodedWithConverter.type);
+  }
+
+  @Test
+  public void testSeveralValuesWithRetryOptionsUseConfiguredMapper() {
+    DataConverter snakeCase = newSnakeCaseConverter();
+    RetryOptions options = fullRetryOptions();
+
+    byte[] data = snakeCase.toData(options, "x");
+    assertArrayEquals(
+        new Object[] {options, "x"},
+        snakeCase.fromDataArray(data, RetryOptions.class, String.class));
+  }
+
+  /** The array of the values is not typed, only the values in it. */
+  @Test
+  public void testSeveralValuesWithDefaultTyping() {
+    DataConverter typed =
+        new JacksonDataConverter(
+            mapper ->
+                mapper.activateDefaultTyping(
+                    LaissezFaireSubTypeValidator.instance, ObjectMapper.DefaultTyping.NON_FINAL));
+    SimplePojo pojo = new SimplePojo("Ann", 41, Arrays.asList("admin"));
+    RetryOptions options = fullRetryOptions();
+
+    byte[] data = typed.toData("a", 1, pojo, options);
+    String json = asString(data);
+    assertTrue(json, json.startsWith("[\"a\",1,[\"" + SimplePojo.class.getName() + "\","));
+    assertArrayEquals(
+        new Object[] {"a", 1, pojo, options},
+        typed.fromDataArray(
+            data, String.class, Integer.class, SimplePojo.class, RetryOptions.class));
+  }
+
   public static final class MaybeHolder {
     final Optional<String> maybe;
 
@@ -1931,5 +2336,95 @@ public class JacksonDataConverterTest {
     assertEquals(
         Optional.empty(),
         converter.fromData(utf8("{}"), MaybeHolder.class, MaybeHolder.class).maybe);
+  }
+
+  @Test
+  public void testMapperForGenericTypes() {
+    DataConverter snakeCase = newSnakeCaseConverter();
+    List<RetryOptions> list = Collections.singletonList(fullRetryOptions());
+    Type listOfOptions = new TypeReference<List<RetryOptions>>() {}.getType();
+
+    // The value is a List, so the configured mapper writes and reads it.
+    byte[] data = snakeCase.toData(list);
+    assertEquals(list, snakeCase.fromData(data, List.class, listOfOptions));
+    assertEquals(list, snakeCase.fromDataArray(data, listOfOptions)[0]);
+
+    RetryOptions[] array = {fullRetryOptions()};
+    assertEquals(asString(data), asString(snakeCase.toData((Object) array)));
+    assertArrayEquals(array, snakeCase.fromData(data, RetryOptions[].class, RetryOptions[].class));
+  }
+
+  /** Loads the classes of the converter package anew, so that they are initialized again. */
+  private static final class FreshConverterClassLoader extends ClassLoader {
+    private static final String PACKAGE_PREFIX =
+        JacksonDataConverter.class.getPackage().getName() + ".";
+
+    FreshConverterClassLoader() {
+      super(JacksonDataConverterTest.class.getClassLoader());
+    }
+
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+      if (!name.startsWith(PACKAGE_PREFIX)) {
+        return super.loadClass(name, resolve);
+      }
+      synchronized (getClassLoadingLock(name)) {
+        Class<?> type = findLoadedClass(name);
+        if (type == null) {
+          byte[] bytes = readClassFile(name);
+          type = defineClass(name, bytes, 0, bytes.length);
+        }
+        if (resolve) {
+          resolveClass(type);
+        }
+        return type;
+      }
+    }
+
+    private byte[] readClassFile(String name) throws ClassNotFoundException {
+      try (InputStream in = getParent().getResourceAsStream(name.replace('.', '/') + ".class")) {
+        if (in == null) {
+          throw new ClassNotFoundException(name);
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        for (int n = in.read(buffer); n >= 0; n = in.read(buffer)) {
+          out.write(buffer, 0, n);
+        }
+        return out.toByteArray();
+      } catch (IOException e) {
+        throw new ClassNotFoundException(name, e);
+      }
+    }
+  }
+
+  /**
+   * The singleton and the converters are usable whichever of them is used first, as the singleton
+   * is created only after all the static fields of the converter are initialized.
+   */
+  @Test
+  public void testGetInstanceIsSingletonAfterStaticInit() throws Exception {
+    RetryOptions options = fullRetryOptions();
+    for (boolean singletonFirst : new boolean[] {true, false}) {
+      Class<?> type =
+          Class.forName(
+              JacksonDataConverter.class.getName(), false, new FreshConverterClassLoader());
+      assertNotSame(JacksonDataConverter.class, type);
+      Method getInstance = type.getMethod("getInstance");
+      Object custom = null;
+      if (!singletonFirst) {
+        custom = type.getConstructor(Function.class).newInstance(Function.identity());
+      }
+      Object instance = getInstance.invoke(null);
+      assertSame(type, instance.getClass());
+      assertSame(instance, getInstance.invoke(null));
+
+      Method toData = type.getMethod("toData", Object[].class);
+      Method fromData = type.getMethod("fromData", byte[].class, Class.class, Type.class);
+      for (Object c : singletonFirst ? Arrays.asList(instance) : Arrays.asList(custom, instance)) {
+        byte[] data = (byte[]) toData.invoke(c, new Object[] {new Object[] {options}});
+        assertEquals(options, fromData.invoke(c, data, RetryOptions.class, RetryOptions.class));
+      }
+    }
   }
 }
