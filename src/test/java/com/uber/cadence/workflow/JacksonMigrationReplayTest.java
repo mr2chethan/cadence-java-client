@@ -26,6 +26,7 @@ import static org.junit.Assume.assumeTrue;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.google.gson.annotations.SerializedName;
 import com.uber.cadence.EventType;
 import com.uber.cadence.HistoryEvent;
 import com.uber.cadence.activity.ActivityOptions;
@@ -173,6 +174,16 @@ public class JacksonMigrationReplayTest {
         Recording.UNTYPED_NUMBERS.resource, withGsonCompatibleNumbers(), NumbersWorkflowImpl.class);
   }
 
+  @Test
+  public void testReplayCheckedInClientPayloadsHistory() throws Exception {
+    WorkflowReplayer.replayWorkflowExecutionFromResource(
+        Recording.CLIENT_PAYLOADS.resource,
+        JacksonDataConverter.getInstance(),
+        ClientPayloadsWorkflowImpl.class);
+    WorkflowReplayer.replayWorkflowExecutionFromResource(
+        Recording.CLIENT_PAYLOADS.resource, customized(), ClientPayloadsWorkflowImpl.class);
+  }
+
   /**
    * The workflow casts untyped numbers to Double, which JacksonDataConverter decodes as Integer by
    * default. It fails, and does not schedule the activity that the history holds, which the replay
@@ -270,7 +281,7 @@ public class JacksonMigrationReplayTest {
     UNTYPED_NUMBERS(
         "testGsonUntypedNumbersHistory.json", "count=3.0 first=1.0 ratio=0.5 total=12.0 unit=kg"),
     CLIENT_PAYLOADS(
-        null,
+        "testGsonClientPayloadsHistory.json",
         "v1 once-ok(c-1) 7/7 twice-ok(c-1) QuotaException: storage over quota 5 [storage/5] v1");
 
     final String resource;
@@ -354,10 +365,11 @@ public class JacksonMigrationReplayTest {
     }
   }
 
-  /** Has only a constructor with several arguments. */
+  /** Has only a constructor with several arguments, and a field renamed with Gson. */
   public static class QuotaException extends RuntimeException {
     private final String resource;
 
+    @SerializedName("max")
     private final int quota;
 
     public QuotaException(String resource, int quota) {

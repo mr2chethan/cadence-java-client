@@ -49,6 +49,7 @@ import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
+import com.google.gson.annotations.SerializedName;
 import com.uber.cadence.ActivityType;
 import com.uber.cadence.MarkerRecordedEventAttributes;
 import com.uber.cadence.WorkflowExecution;
@@ -179,6 +180,11 @@ public class JacksonDataConverterGsonReadCompatibilityTest {
   public static class WithValue {
     public String value;
     public int other;
+  }
+
+  public static class SerializedValue {
+    @SerializedName("value")
+    public String text;
   }
 
   public static class Optionals {
@@ -593,10 +599,13 @@ public class JacksonDataConverterGsonReadCompatibilityTest {
         read(JACKSON, "{\"value\":1}", new TypeReference<Optional<JsonNode>>() {}).get();
     assertEquals(1, node.get("value").intValue());
 
-    // A bean with a "value" property.
+    // A bean with a "value" property, also one renamed with @SerializedName.
     WithValue withValue =
         read(JACKSON, "{\"value\":\"v\"}", new TypeReference<Optional<WithValue>>() {}).get();
     assertEquals("v", withValue.value);
+    SerializedValue serializedValue =
+        read(JACKSON, "{\"value\":\"v\"}", new TypeReference<Optional<SerializedValue>>() {}).get();
+    assertEquals("v", serializedValue.text);
     // Gson's form of such an Optional fails rather than giving another value.
     assertThrows(
         DataConverterException.class,
