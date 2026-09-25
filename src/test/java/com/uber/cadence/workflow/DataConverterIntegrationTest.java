@@ -25,6 +25,9 @@ import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
 import com.google.common.base.Splitter;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.annotations.SerializedName;
 import com.uber.cadence.EventType;
 import com.uber.cadence.HistoryEvent;
 import com.uber.cadence.TimeoutType;
@@ -49,13 +52,16 @@ import com.uber.cadence.testing.TestWorkflowEnvironment;
 import com.uber.cadence.worker.Worker;
 import com.uber.cadence.worker.WorkerFactoryOptions;
 import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalDouble;
@@ -238,6 +244,49 @@ public class DataConverterIntegrationTest {
   }
 
   @Test
+  public void testGsonAnnotatedPayloadsEndToEnd() throws Exception {
+    Map<Priority, String> labels = new LinkedHashMap<>();
+    labels.put(Priority.LOW, "ground");
+    JsonObject extras =
+        JsonParser.parseString("{\"fragile\":true,\"weight\":1.5,\"tags\":[\"glass\",7]}")
+            .getAsJsonObject();
+    Parcel parcel = new Parcel("p-1", Priority.LOW, labels, extras);
+    ParcelWorkflow workflow = client.newWorkflowStub(ParcelWorkflow.class);
+    WorkflowClient.start(workflow::run, parcel);
+    workflow.relabel(parcel.with(Priority.LOW, "freight"));
+
+    Parcel expected = parcel.with(Priority.HIGH, "express").with(Priority.LOW, "freight");
+    assertEquals(expected, resultOf(workflow, Parcel.class));
+    assertEquals(expected, workflow.current());
+
+    // Written under the names given by the annotations, and with the Gson tree as the JSON that it
+    // holds, as JsonDataConverter does.
+    List<HistoryEvent> history =
+        historyOf(testEnvironment, WorkflowStub.fromTyped(workflow).getExecution());
+    String input =
+        new String(
+            history.get(0).getWorkflowExecutionStartedEventAttributes().getInput(),
+            StandardCharsets.UTF_8);
+    assertTrue(input, input.contains("\"parcel_id\":\"p-1\""));
+    assertTrue(input, input.contains("\"prio\":\"low\""));
+    assertTrue(input, input.contains("\"labels_by_priority\":{"));
+    assertTrue(
+        input,
+        input.contains("\"extras\":{\"fragile\":true,\"weight\":1.5,\"tags\":[\"glass\",7]}"));
+    List<String> activityResults = new ArrayList<>();
+    for (HistoryEvent event : history) {
+      if (event.getEventType() == EventType.ActivityTaskCompleted) {
+        activityResults.add(
+            new String(
+                event.getActivityTaskCompletedEventAttributes().getResult(),
+                StandardCharsets.UTF_8));
+      }
+    }
+    assertEquals(1, activityResults.size());
+    assertTrue(activityResults.get(0), activityResults.get(0).contains("\"prio\":\"high\""));
+  }
+
+  @Test
   public void testActivityFailureCause() throws Exception {
     assertEquals(
         codeExceptionDescription("rejectWithCode"), runScenario(Scenario.CATCH_ACTIVITY_FAILURE));
@@ -356,7 +405,8 @@ public class DataConverterIntegrationTest {
         ItemsWorkflowImpl.class,
         MoneyWorkflowImpl.class,
         OptionalWorkflowImpl.class,
-        OutcomeWorkflowImpl.class);
+        OutcomeWorkflowImpl.class,
+        ParcelWorkflowImpl.class);
     worker.registerActivitiesImplementations(activitiesImpl);
     environment.start();
     return environment;
@@ -606,6 +656,73 @@ public class DataConverterIntegrationTest {
     }
   }
 
+  /** Renamed with Gson's annotations, which JacksonDataConverter applies too. */
+  public enum Priority {
+    @SerializedName("low")
+    LOW,
+    @SerializedName(
+      value = "high",
+      alternate = {"urgent"}
+    )
+    HIGH
+  }
+
+  /** Its fields are renamed with Gson's annotations, and it has a field of a Gson tree type. */
+  public static final class Parcel {
+    @SerializedName("parcel_id")
+    private final String id;
+
+    @SerializedName(
+      value = "prio",
+      alternate = {"priority"}
+    )
+    private final Priority priority;
+
+    @SerializedName("labels_by_priority")
+    private final Map<Priority, String> labels;
+
+    private final JsonObject extras;
+
+    public Parcel(String id, Priority priority, Map<Priority, String> labels, JsonObject extras) {
+      this.id = id;
+      this.priority = priority;
+      this.labels = labels;
+      this.extras = extras;
+    }
+
+    /** A copy with the priority and its label. */
+    Parcel with(Priority priority, String label) {
+      Map<Priority, String> newLabels = new LinkedHashMap<>(labels);
+      newLabels.put(priority, label);
+      return new Parcel(id, priority, newLabels, extras);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof Parcel)) {
+        return false;
+      }
+      Parcel parcel = (Parcel) o;
+      return Objects.equals(id, parcel.id)
+          && priority == parcel.priority
+          && Objects.equals(labels, parcel.labels)
+          && Objects.equals(extras, parcel.extras);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(id, priority, labels, extras);
+    }
+
+    @Override
+    public String toString() {
+      return id + " " + priority + " " + labels + " " + extras;
+    }
+  }
+
   public interface TestActivities {
     Money doubleAmount(Money amount);
 
@@ -622,6 +739,8 @@ public class DataConverterIntegrationTest {
     OptionalValues next(OptionalValues values);
 
     Outcome outcome();
+
+    Parcel prioritize(Parcel parcel);
   }
 
   public static class TestActivitiesImpl implements TestActivities {
@@ -674,6 +793,11 @@ public class DataConverterIntegrationTest {
     @Override
     public Outcome outcome() {
       return new Outcome("rejected", new CodeException("rejected", 42));
+    }
+
+    @Override
+    public Parcel prioritize(Parcel parcel) {
+      return parcel.with(Priority.HIGH, "express");
     }
   }
 
@@ -922,6 +1046,43 @@ public class DataConverterIntegrationTest {
     @Override
     public Outcome run() {
       return newActivityStub().outcome();
+    }
+  }
+
+  public interface ParcelWorkflow {
+    @WorkflowMethod(
+      executionStartToCloseTimeoutSeconds = WORKFLOW_TIMEOUT_SECONDS,
+      taskList = TASK_LIST
+    )
+    Parcel run(Parcel parcel);
+
+    @SignalMethod
+    void relabel(Parcel parcel);
+
+    @QueryMethod
+    Parcel current();
+  }
+
+  public static class ParcelWorkflowImpl implements ParcelWorkflow {
+    private Parcel current;
+    private Parcel relabeled;
+
+    @Override
+    public Parcel run(Parcel parcel) {
+      current = newActivityStub().prioritize(parcel);
+      Workflow.await(() -> relabeled != null);
+      current = current.with(relabeled.priority, relabeled.labels.get(relabeled.priority));
+      return current;
+    }
+
+    @Override
+    public void relabel(Parcel parcel) {
+      relabeled = parcel;
+    }
+
+    @Override
+    public Parcel current() {
+      return current;
     }
   }
 

@@ -40,6 +40,9 @@ import com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.uber.cadence.ActivityType;
 import com.uber.cadence.TimeoutType;
 import com.uber.cadence.WorkflowExecution;
@@ -2365,6 +2368,11 @@ public class JacksonDataConverterTest {
     }
   }
 
+  public static final class GsonTreeHolder {
+    JsonElement tree;
+    JsonArray array;
+  }
+
   @Test
   public void testExceptionsWithDefaultTyping() {
     DataConverter typed =
@@ -2397,6 +2405,20 @@ public class JacksonDataConverterTest {
     assertEquals(ACTIVITY_TYPE, decodedTimeout.getActivityType());
     assertEquals(TimeoutType.HEARTBEAT, decodedTimeout.getTimeoutType());
     assertEquals("progress", decodedTimeout.getDetails(String.class));
+
+    GsonTreeHolder holder = new GsonTreeHolder();
+    JsonObject tree = new JsonObject();
+    tree.addProperty("n", 1);
+    tree.addProperty("s", "x");
+    holder.tree = tree;
+    holder.array = new JsonArray();
+    holder.array.add(2.5);
+    String holderJson = asString(typed.toData(holder));
+    assertTrue(holderJson, holderJson.contains("\"tree\":{\"n\":1,\"s\":\"x\"},\"array\":[2.5]"));
+    GsonTreeHolder decodedHolder =
+        typed.fromData(utf8(holderJson), GsonTreeHolder.class, GsonTreeHolder.class);
+    assertEquals(tree, decodedHolder.tree);
+    assertEquals(holder.array, decodedHolder.array);
 
     ConverterAndClass withConverter = new ConverterAndClass();
     withConverter.converter = typed;
